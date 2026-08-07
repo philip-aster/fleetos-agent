@@ -26,21 +26,28 @@ impl EbpfEngine {
         let mut ebpf = Ebpf::load(EBPF_BYTECODE)
             .context("Failed to load embedded eBPF ELF binary into kernel")?;
 
-        // 2. Initialize eBPF logger if present
+        // 2. Load the Traffic Control (TC) ingress filter classifier into kernel verifier FIRST
+        {
+            let program: &mut SchedClassifier = ebpf
+                .program_mut("tc_ingress_filter")
+                .context("Failed to locate 'tc_ingress_filter' program in eBPF bytecode")?
+                .try_into()?;
+
+            program.load()?;
+        }
+
+        // 3. NOW initialize eBPF logger (maps are loaded in kernel)
         if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
             tracing::warn!("eBPF logger initialization skipped/failed: {}", e);
         }
 
-        // 3. Attach Traffic Control (TC) ingress filter classifier
+        // 4. Ensure TC qdisc is attached and attach program
+        let _ = tc::qdisc_add_clsact(iface);
+
         let program: &mut SchedClassifier = ebpf
             .program_mut("tc_ingress_filter")
-            .context("Failed to locate 'tc_ingress_filter' program in eBPF bytecode")?
+            .context("Failed to locate 'tc_ingress_filter' for attach")?
             .try_into()?;
-
-        program.load()?;
-
-        // Ensure TC qdisc is attached to network interface
-        let _ = tc::qdisc_add_clsact(iface);
 
         program.attach(iface, TcAttachType::Ingress)?;
         info!(
