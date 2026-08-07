@@ -1,5 +1,3 @@
-// fleetos-agent/src/identity_sync.rs
-
 use crate::ebpf_loader::EbpfEngine;
 use fleetos_ebpf_common::{EbpfPolicyKey, EbpfPolicyValue};
 use std::sync::Arc;

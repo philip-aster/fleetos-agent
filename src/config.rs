@@ -9,6 +9,7 @@ pub struct Cli {
     pub config: PathBuf,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
 pub struct AgentConfig {
     pub node_id: String,

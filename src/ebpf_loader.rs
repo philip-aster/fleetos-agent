@@ -1,5 +1,3 @@
-// fleetos-agent/src/ebpf_loader.rs
-
 use anyhow::{Context, Result};
 use aya::{
     Ebpf,
