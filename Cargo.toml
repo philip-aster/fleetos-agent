@@ -14,4 +14,5 @@ toml = "1.1.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+fleetos-core = { version = "0.1.0", path = "../fleetos-core" }
 fleetos-ebpf-common = { version = "0.1.0", path = "../fleetos-ebpf/fleetos-ebpf-common", features = ["user"] }
