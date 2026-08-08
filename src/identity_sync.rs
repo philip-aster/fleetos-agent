@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use fleetos_core::proto::state::{
     EventType, WatchRequest, state_service_client::StateServiceClient,
 };
+use fleetos_core::spiffe::SpiffeId;
 use fleetos_ebpf_common::{EbpfPolicyKey, EbpfPolicyValue};
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
@@ -65,7 +66,10 @@ impl IdentitySyncWorker {
         info!("Subscribing to policy state updates via Watch API...");
 
         // 2. Build watch request for policy keys
+        let spiffe_id = SpiffeId::new_node("fleetos.mesh", "default", &self.node_id).to_uri();
         let request = WatchRequest {
+            node_id: self.node_id.clone(),
+            spiffe_id,
             start_revision: 0,
             key_prefix: format!("/policies/{}", self.node_id).into_bytes(),
         };
