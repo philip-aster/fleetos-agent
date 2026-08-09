@@ -1,6 +1,6 @@
 // fleetos-agent/src/identity_sync.rs
 
-use crate::ebpf_loader::EbpfEngine;
+use crate::network::ebpf_loader::EbpfEngine;
 use anyhow::{Context, Result};
 use fleetos_core::proto::state::{
     EventType, WatchRequest, state_service_client::StateServiceClient,

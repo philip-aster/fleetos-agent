@@ -11,7 +11,7 @@ use tracing::info;
 
 /// Bake compiled eBPF bytecode directly into the agent binary at compile time
 static EBPF_BYTECODE: &[u8] =
-    include_bytes!("../../fleetos-ebpf/target/bpfel-unknown-none/release/ebpf");
+    include_bytes!("../../../fleetos-ebpf/target/bpfel-unknown-none/release/ebpf");
 
 pub struct EbpfEngine {
     ebpf: Arc<Mutex<Ebpf>>,

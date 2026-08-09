@@ -1,13 +1,12 @@
 mod attestation;
 mod config;
-mod ebpf_loader;
 mod identity_sync;
+mod network;
 mod network_manager;
-
 use clap::Parser;
 use config::{AgentConfig, Cli};
-use ebpf_loader::EbpfEngine;
 use identity_sync::IdentitySyncWorker;
+use network::ebpf_loader::EbpfEngine;
 use network_manager::NetworkManager;
 use std::sync::Arc;
 use tracing::{error, info};
