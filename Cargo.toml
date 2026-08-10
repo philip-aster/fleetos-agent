@@ -14,6 +14,7 @@ toml = "1.1.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 fleetos-core = { version = "0.1.0", path = "../fleetos-core" }
+fleetos-control = { version = "0.1.0", path = "../fleetos-control" }
 fleetos-ebpf-common = { version = "0.1.0", path = "../fleetos-ebpf/fleetos-ebpf-common", features = ["user"] }
 serde_json = "1.0.151"
 tonic = "0.14.6"
@@ -25,3 +26,8 @@ hyper = { version = "1.11.0", features = ["full"] }
 
 [build-dependencies]
 tonic-build = "0.14.6"
+
+[dev-dependencies]
+fleetos-agent = { path = "." }
+fleetos-control = { path = "../fleetos-control", features = ["test-helpers"] }
+tempfile = "3.27.0"

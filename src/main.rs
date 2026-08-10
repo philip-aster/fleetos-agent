@@ -1,18 +1,17 @@
-mod attestation;
-mod config;
-mod identity_sync;
-mod network;
-mod network_manager;
-mod runtime;
-mod workload_sync;
 use clap::Parser;
-use config::{AgentConfig, Cli};
-use identity_sync::IdentitySyncWorker;
-use network::ebpf_loader::EbpfEngine;
-use network_manager::NetworkManager;
 use std::sync::Arc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+
+use fleetos_agent::{
+    attestation::BootAttestor,
+    config::{AgentConfig, Cli},
+    identity_sync::IdentitySyncWorker,
+    network::ebpf_loader::EbpfEngine,
+    network_manager::NetworkManager,
+    runtime::RuntimeDriver,
+    workload_sync::WorkloadSyncWorker,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -29,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Hardware Attestation via IdentityService
     let mock_attestor = fleetos_core::attestor::mock::MockHardwareAttestor::new();
-    let boot_attestor = attestation::BootAttestor::new(config.control_plane_endpoint.clone());
+    let boot_attestor = BootAttestor::new(config.control_plane_endpoint.clone());
 
     let spiffe_id = match boot_attestor.authenticate_host(&mock_attestor).await {
         Ok(id) => id,
@@ -47,15 +46,31 @@ async fn main() -> anyhow::Result<()> {
     // Load embedded eBPF programs into host kernel
     let ebpf_engine = Arc::new(EbpfEngine::load_and_attach(&config.network_interface)?);
 
-    // Initialize IdentitySyncWorker with gRPC endpoint, Node ID, and eBPF engine
+    // Initialize RuntimeDriver (Containerd + CloudHypervisor)
+    let runtime_driver = Arc::new(RuntimeDriver::new());
+
+    // Initialize IdentitySyncWorker
     let sync_worker = IdentitySyncWorker::new(
         config.control_plane_endpoint.clone(),
-        spiffe_id,
+        spiffe_id.clone(),
         ebpf_engine.clone(),
     );
 
+    // Initialize WorkloadSyncWorker
+    let workload_worker = WorkloadSyncWorker::new(
+        config.control_plane_endpoint.clone(),
+        config.node_id.clone(),
+        runtime_driver,
+    );
+
+    // Spawn identity & eBPF policy sync worker
     tokio::spawn(async move {
         sync_worker.run_sync_loop().await;
+    });
+
+    // Spawn workload pod sync worker
+    tokio::spawn(async move {
+        workload_worker.run_sync_loop().await;
     });
 
     info!("FleetOS Node Agent operational. Press Ctrl+C to stop.");

@@ -1,10 +1,10 @@
 use crate::runtime::RuntimeDriver;
 use anyhow::{Context, Result};
+use fleetos_core::PodSpec;
 use fleetos_core::proto::state::{
     EventType, WatchRequest, state_service_client::StateServiceClient,
 };
 use fleetos_core::spiffe::SpiffeId;
-use fleetos_core::{PodSpec, RuntimeEngine};
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
