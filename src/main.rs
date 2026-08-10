@@ -3,6 +3,8 @@ mod config;
 mod identity_sync;
 mod network;
 mod network_manager;
+mod runtime;
+mod workload_sync;
 use clap::Parser;
 use config::{AgentConfig, Cli};
 use identity_sync::IdentitySyncWorker;

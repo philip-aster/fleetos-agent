@@ -13,6 +13,15 @@ tokio = { version = "1.53.1", features = ["full"] }
 toml = "1.1.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-
 fleetos-core = { version = "0.1.0", path = "../fleetos-core" }
 fleetos-ebpf-common = { version = "0.1.0", path = "../fleetos-ebpf/fleetos-ebpf-common", features = ["user"] }
+serde_json = "1.0.151"
+tonic = "0.14.6"
+tower = { version = "0.5.3", features = ["util"] }
+hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "tokio", "http1"] }
+http = "1.5.0"
+http-body-util = "0.1.4"
+hyper = { version = "1.11.0", features = ["full"] }
+
+[build-dependencies]
+tonic-build = "0.14.6"
