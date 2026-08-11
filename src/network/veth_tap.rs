@@ -6,7 +6,7 @@ pub struct NetworkInterfaceManager;
 
 impl NetworkInterfaceManager {
     /// Creates a host TAP interface for Cloud-Hypervisor MicroVM network binding
-    pub async fn create_tap_interface(tap_name: &str, owner_uid: u32) -> Result<()> {
+    pub async fn create_tap_interface(tap_name: &str, _owner_uid: u32) -> Result<()> {
         info!(
             "Creating TAP interface '{}' for MicroVM binding...",
             tap_name

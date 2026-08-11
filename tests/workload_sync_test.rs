@@ -11,8 +11,8 @@ use fleetos_agent::workload_sync::WorkloadSyncWorker;
 use fleetos_control::test_helpers::spawn_test_control_plane;
 use fleetos_core::proto::state::{PutRequest, state_service_client::StateServiceClient};
 use fleetos_core::{
-    CloudHypervisorConfig, ContainerSpec, PodRole, PodSpec, ResourceRequirements, RestartPolicy,
-    RuntimeEngine,
+    CloudHypervisorConfig, ContainerSpec, PodRole, PodSpec, QosClass, ResourceRequirements,
+    RestartPolicy, RuntimeEngine,
 };
 
 #[tokio::test]
@@ -46,6 +46,7 @@ async fn test_workload_sync_receives_pod_dispatch() -> Result<()> {
         runtime: RuntimeEngine::CloudHypervisor(CloudHypervisorConfig::default()),
         labels: HashMap::new(),
         annotations: HashMap::new(),
+        qos: QosClass::default(),
         containers: vec![ContainerSpec {
             name: "main".to_string(),
             image: "alpine:latest".to_string(),
