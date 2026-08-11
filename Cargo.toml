@@ -23,6 +23,7 @@ hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "tokio
 http = "1.5.0"
 http-body-util = "0.1.4"
 hyper = { version = "1.11.0", features = ["full"] }
+blake3 = "1.8.6"
 
 [build-dependencies]
 tonic-build = "0.14.6"

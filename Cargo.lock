@@ -820,6 +820,7 @@ dependencies = [
  "anyhow",
  "aya",
  "aya-log",
+ "blake3",
  "clap",
  "fleetos-agent",
  "fleetos-control",

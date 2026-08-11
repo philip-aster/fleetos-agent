@@ -7,9 +7,8 @@ use aya::{
 use fleetos_ebpf_common::{EbpfPolicyKey, EbpfPolicyValue};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
-/// Bake compiled eBPF bytecode directly into the agent binary at compile time
 static EBPF_BYTECODE: &[u8] =
     include_bytes!("../../../fleetos-ebpf/target/bpfel-unknown-none/release/ebpf");
 
@@ -18,15 +17,15 @@ pub struct EbpfEngine {
 }
 
 impl EbpfEngine {
-    /// Loads embedded eBPF bytecode into host kernel memory and attaches classifiers
     pub fn load_and_attach(iface: &str) -> Result<Self> {
-        info!("Loading embedded eBPF bytecode into kernel...");
+        info!(
+            "Loading embedded eBPF bytecode into kernel on interface {}...",
+            iface
+        );
 
-        // 1. Load directly from in-memory byte slice using aya::Ebpf::load
         let mut ebpf = Ebpf::load(EBPF_BYTECODE)
             .context("Failed to load embedded eBPF ELF binary into kernel")?;
 
-        // 2. Load the Traffic Control (TC) ingress filter classifier into kernel verifier FIRST
         {
             let program: &mut SchedClassifier = ebpf
                 .program_mut("tc_ingress_filter")
@@ -36,12 +35,10 @@ impl EbpfEngine {
             program.load()?;
         }
 
-        // 3. NOW initialize eBPF logger (maps are loaded in kernel)
         if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
-            tracing::warn!("eBPF logger initialization skipped/failed: {}", e);
+            warn!("eBPF logger initialization skipped/failed: {}", e);
         }
 
-        // 4. Ensure TC qdisc is attached and attach program
         let _ = tc::qdisc_add_clsact(iface);
 
         let program: &mut SchedClassifier = ebpf
@@ -60,18 +57,33 @@ impl EbpfEngine {
         })
     }
 
-    /// Safely writes an authorization policy rule into the kernel BPF_MAP_HASH table
     pub async fn update_policy(&self, key: EbpfPolicyKey, value: EbpfPolicyValue) -> Result<()> {
         let mut ebpf = self.ebpf.lock().await;
-        let mut policy_map: AyaHashMap<_, EbpfPolicyKey, EbpfPolicyValue> =
-            AyaHashMap::try_from(ebpf.map_mut("POLICY_MAP").context("POLICY_MAP not found")?)?;
+        let mut policy_map: AyaHashMap<_, EbpfPolicyKey, EbpfPolicyValue> = AyaHashMap::try_from(
+            ebpf.map_mut("POLICY_MAP")
+                .context("POLICY_MAP not found in eBPF binary")?,
+        )?;
 
-        // Insert rule into kernel memory (0 = BPF_ANY flags)
         policy_map.insert(key, value, 0)?;
         info!(
-            "Kernel Policy Map Updated -> Target Port: {}, Action: {}",
+            "Kernel eBPF Policy Map Updated -> Port: {}, Action: {}",
             key.port, value.action
         );
+
+        Ok(())
+    }
+
+    pub async fn remove_policy(&self, key: &EbpfPolicyKey) -> Result<()> {
+        let mut ebpf = self.ebpf.lock().await;
+        let mut policy_map: AyaHashMap<_, EbpfPolicyKey, EbpfPolicyValue> = AyaHashMap::try_from(
+            ebpf.map_mut("POLICY_MAP")
+                .context("POLICY_MAP not found in eBPF binary")?,
+        )?;
+
+        if policy_map.get(key, 0).is_ok() {
+            policy_map.remove(key)?;
+            info!("Kernel eBPF Policy Map Entry Removed -> Port: {}", key.port);
+        }
 
         Ok(())
     }

@@ -110,8 +110,22 @@ impl IdentitySyncWorker {
                     }
                 }
                 Ok(EventType::Delete) => {
-                    info!("Received policy delete event for key");
-                    // Can implement ebpf_engine.delete_policy(key) here when needed
+                    if watch_resp.key.len() == std::mem::size_of::<EbpfPolicyKey>() {
+                        let mut key_bytes = [0u8; std::mem::size_of::<EbpfPolicyKey>()];
+                        key_bytes.copy_from_slice(&watch_resp.key);
+
+                        let key: EbpfPolicyKey = unsafe { std::mem::transmute(key_bytes) };
+
+                        if let Err(e) = self.ebpf_engine.remove_policy(&key).await {
+                            error!("Failed to remove policy rule from eBPF map: {}", e);
+                        } else {
+                            info!("Successfully removed policy rule from kernel eBPF map!");
+                        }
+                    } else {
+                        warn!(
+                            "Received invalid byte length for policy delete key in WatchResponse"
+                        );
+                    }
                 }
                 _ => {}
             }

@@ -1,7 +1,13 @@
 pub mod attestation;
 pub mod config;
+pub mod eviction;
 pub mod identity_sync;
+pub mod metrics;
 pub mod network;
 pub mod network_manager;
+pub mod pod;
+pub mod probes;
 pub mod runtime;
+pub mod volume;
+pub mod vsock;
 pub mod workload_sync;
