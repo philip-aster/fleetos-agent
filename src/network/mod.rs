@@ -106,7 +106,7 @@ impl NetworkManager {
             Some(pod.if_index)
         } else {
             // Remote path (Hand off to local fleetos-router)
-            let guard = self.router_tap_if_index.blocking_lock();
+            let guard = self.router_tap_if_index.lock().await;
             *guard
         }
     }

@@ -13,11 +13,24 @@ pub struct RuntimeSupervisor {
     containerd: ContainerdDriver,
 }
 
+pub type RuntimeManager = RuntimeSupervisor;
+
 impl RuntimeSupervisor {
     pub fn new() -> Self {
         Self {
             cloud_hypervisor: CloudHypervisorDriver::default(),
             containerd: ContainerdDriver::default(),
+        }
+    }
+
+    /// Allows constructing a RuntimeSupervisor with custom socket paths
+    pub fn with_socket_paths(
+        ch_base_dir: impl Into<String>,
+        containerd_socket: impl Into<String>,
+    ) -> Self {
+        Self {
+            cloud_hypervisor: CloudHypervisorDriver::new(ch_base_dir),
+            containerd: ContainerdDriver::new(containerd_socket, "fleetos"),
         }
     }
 

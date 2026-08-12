@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use tokio::sync::broadcast;
 use tokio::time::sleep;
 
 use fleetos_agent::network::NetworkManager;
@@ -38,9 +39,12 @@ async fn test_workload_sync_receives_pod_dispatch() -> Result<()> {
         pod_manager.clone(),
     );
 
-    // 4. Spawn WorkloadSyncWorker in background
-    tokio::spawn(async move {
-        worker.run_sync_loop().await;
+    // Broadcast channel for worker loop control
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(16);
+
+    // 4. Spawn WorkloadSyncWorker in background passing shutdown receiver
+    let sync_handle = tokio::spawn(async move {
+        worker.run_sync_loop(shutdown_rx).await;
     });
 
     sleep(Duration::from_millis(300)).await;
@@ -87,6 +91,10 @@ async fn test_workload_sync_receives_pod_dispatch() -> Result<()> {
 
     // Verify Pod was received and spawned into PodManager
     assert_eq!(pod_manager.active_pod_count().await, 1);
+
+    // Cleanly signal background worker shutdown
+    let _ = shutdown_tx.send(());
+    let _ = sync_handle.await;
 
     Ok(())
 }

@@ -1,10 +1,10 @@
-// fleetos-agent/src/attestation.rs
-
 use anyhow::{Context, Result};
 use fleetos_core::HardwareAttestor;
 use fleetos_core::proto::identity::{
     AttestNodeRequest, PcrValue, identity_service_client::IdentityServiceClient,
 };
+use std::time::Duration;
+use tonic::transport::Endpoint;
 use tracing::info;
 
 pub struct BootAttestor {
@@ -19,12 +19,20 @@ impl BootAttestor {
     }
 
     /// Generates hardware attestation quote and authenticates with IdentityService on control plane
-    pub async fn authenticate_host<A: HardwareAttestor>(&self, attestor: &A) -> Result<String> {
-        info!("Generating TPM hardware quote for node attestation...");
+    pub async fn authenticate_host<A: HardwareAttestor>(
+        &self,
+        attestor: &A,
+        join_token: &str,
+    ) -> Result<String> {
+        info!("Generating TPM hardware quote for host attestation...");
 
-        // 1. Generate TPM quote with a nonce
+        // 1. Generate fresh 32-byte nonce for TPM quote generation
+        let mut nonce = [0u8; 32];
+        rand::fill(&mut nonce);
+
+        // 2. Generate TPM quote signed by AK
         let quote = attestor
-            .generate_quote(b"fleetos-attestation-nonce")
+            .generate_quote(&nonce)
             .await
             .context("Failed to generate TPM quote")?;
 
@@ -37,14 +45,18 @@ impl BootAttestor {
             })
             .collect();
 
-        // 2. Connect to IdentityService on control plane
-        let mut client = IdentityServiceClient::connect(self.control_plane_endpoint.clone())
+        // 3. Connect to IdentityService on control plane with connection timeout
+        let endpoint = Endpoint::from_shared(self.control_plane_endpoint.clone())?
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10));
+
+        let mut client = IdentityServiceClient::connect(endpoint)
             .await
             .context("Failed to connect to IdentityService on control plane")?;
 
-        // 3. Submit attestation request
+        // 4. Construct request matching proto fields exactly
         let request = AttestNodeRequest {
-            join_token: "cluster-bootstrap-token".to_string(),
+            join_token: join_token.to_string(),
             public_identity_key: quote.public_identity_key,
             signature_quote: quote.signature_quote,
             pcr_values,

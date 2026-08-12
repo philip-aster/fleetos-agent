@@ -25,7 +25,7 @@ impl ContainerdDriver {
     async fn connect(&self) -> Result<Channel> {
         let socket_path = self.socket_path.clone();
 
-        let channel = Endpoint::try_from("http://[::]:50051")?
+        let channel = Endpoint::from_static("http://localhost")
             .connect_with_connector(service_fn(move |_: Uri| {
                 let path = socket_path.clone();
                 async move {
@@ -94,13 +94,12 @@ impl ContainerdDriver {
 
         // Inject SPIFFE Identity & Network metadata into OCI container specs
         let mut env_vars = container.env.clone();
-        if let Some(spiffe_id) = &pod.role.spiffe_id {
-            env_vars.insert("SPIFFE_ID".to_string(), spiffe_id.clone());
-            env_vars.insert(
-                "SPIFFE_ENDPOINT_SOCKET".to_string(),
-                "/run/fleetos/agent.sock".to_string(),
-            );
-        }
+        let spiffe_id = format!("spiffe://fleetos.mesh/ns/{}/sa/{}", pod.namespace, pod.name);
+        env_vars.insert("SPIFFE_ID".to_string(), spiffe_id);
+        env_vars.insert(
+            "SPIFFE_ENDPOINT_SOCKET".to_string(),
+            "/run/fleetos/agent.sock".to_string(),
+        );
 
         if let Some(ip) = assigned_ip {
             env_vars.insert("POD_IP".to_string(), ip.to_string());

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
+use crate::network::veth_tap::NetworkInterfaceManager;
 use crate::network::{LocalPodEndpoint, NetworkManager};
 use crate::runtime::RuntimeSupervisor;
 
@@ -51,19 +52,33 @@ pub fn spawn_pod_worker(
             pod_id_clone
         );
 
-        let spiffe_id = pod.role.spiffe_id.clone().unwrap_or_else(|| {
-            format!("spiffe://fleetos.mesh/ns/{}/sa/{}", pod.namespace, pod.name)
-        });
+        let spiffe_id = format!("spiffe://fleetos.mesh/ns/{}/sa/{}", pod.namespace, pod.name);
 
-        // IP allocation logic / TAP interface derivation
-        let assigned_ip: Ipv4Addr = "10.244.1.100".parse().unwrap();
+        // Dynamically derive TAP interface name
         let tap_name = format!(
             "tap-{}",
             &pod_id_clone[..std::cmp::min(10, pod_id_clone.len())]
         );
-        let if_index = 42; // TAP interface index from netlink
 
-        // 1. Register with local NetworkManager for same-node eBPF fast-path redirection
+        // 1. Create host TAP device and fetch real kernel ifindex
+        // (UID 1000 or designated unprivileged runtime user)
+        let owner_uid = 1000;
+        let if_index =
+            match NetworkInterfaceManager::create_tap_interface(&tap_name, owner_uid).await {
+                Ok(idx) => idx,
+                Err(e) => {
+                    error!(
+                        "[PodWorker:{}] Failed to create TAP interface '{}': {:?}",
+                        pod_id_clone, tap_name, e
+                    );
+                    return;
+                }
+            };
+
+        // IP allocation logic (IPAM assignment or static subnet mapping)
+        let assigned_ip: Ipv4Addr = "10.244.1.100".parse().unwrap();
+
+        // 2. Register with local NetworkManager for same-node eBPF fast-path redirection
         let endpoint = LocalPodEndpoint {
             pod_id: pod_id_clone.clone(),
             spiffe_id: spiffe_id.clone(),
@@ -77,10 +92,11 @@ pub fn spawn_pod_worker(
                 "[PodWorker:{}] Failed to register local network fast-path: {:?}",
                 pod_id_clone, e
             );
+            let _ = NetworkInterfaceManager::delete_interface(&tap_name).await;
             return;
         }
 
-        // 2. Apply default eBPF security ingress rules
+        // 3. Apply default eBPF security ingress rules
         if let Err(e) = network_manager
             .allow_spiffe_traffic(&spiffe_id, &spiffe_id, 8080)
             .await
@@ -91,7 +107,7 @@ pub fn spawn_pod_worker(
             );
         }
 
-        // 3. Boot runtime via RuntimeSupervisor (CloudHypervisor / Containerd)
+        // 4. Boot runtime via RuntimeSupervisor (CloudHypervisor / Containerd)
         let ip_str = assigned_ip.to_string();
         info!(
             "[PodWorker:{}] Executing boot sequence via RuntimeSupervisor...",
@@ -104,6 +120,7 @@ pub fn spawn_pod_worker(
         {
             error!("[PodWorker:{}] Runtime boot failed: {:?}", pod_id_clone, e);
             let _ = network_manager.unregister_local_pod(&assigned_ip).await;
+            let _ = NetworkInterfaceManager::delete_interface(&tap_name).await;
             return;
         }
 
@@ -112,7 +129,7 @@ pub fn spawn_pod_worker(
             pod_id_clone
         );
 
-        // 4. Command loop
+        // 5. Command loop
         while let Some(cmd) = rx_cmd.recv().await {
             match cmd {
                 PodCommand::Stop { responder } => {
@@ -124,7 +141,10 @@ pub fn spawn_pod_worker(
                     // Unregister local eBPF fast-path
                     let unreg_res = network_manager.unregister_local_pod(&assigned_ip).await;
 
-                    let final_res = stop_res.and(unreg_res);
+                    // Delete TAP interface from host netstack
+                    let tap_del_res = NetworkInterfaceManager::delete_interface(&tap_name).await;
+
+                    let final_res = stop_res.and(unreg_res).and(tap_del_res);
                     let _ = responder.send(final_res);
                     break;
                 }

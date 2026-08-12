@@ -1,15 +1,9 @@
 use fleetos_core::PodSpec;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::SystemTime;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PodPhase {
-    Pending,
-    Booting,
-    Running,
-    Failed(String),
-    Terminated,
-}
+use crate::pod::types::PodPhase;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerStatus {
@@ -46,15 +40,30 @@ impl PodStatusEvaluator {
         &self,
         pod: &PodSpec,
         phase: PodPhase,
+        vsock_cid: u32,
         container_readiness: Vec<(String, bool)>,
     ) -> PodStatusReport {
+        // Map container names to their spec images
+        let container_images: HashMap<String, String> = pod
+            .containers
+            .iter()
+            .map(|c| (c.name.clone(), c.image.clone()))
+            .collect();
+
         let container_statuses = container_readiness
             .into_iter()
-            .map(|(name, ready)| ContainerStatus {
-                name,
-                ready,
-                restart_count: 0,
-                image: "fleetos/workload:latest".to_string(),
+            .map(|(name, ready)| {
+                let image = container_images
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                ContainerStatus {
+                    name,
+                    ready,
+                    restart_count: 0,
+                    image,
+                }
             })
             .collect();
 
@@ -65,10 +74,10 @@ impl PodStatusEvaluator {
 
         PodStatusReport {
             pod_id: pod.id.clone(),
-            namespace: "default".to_string(),
+            namespace: pod.namespace.clone(),
             node_id: self.node_id.clone(),
             phase,
-            vsock_cid: 3, // Default VSOCK CID
+            vsock_cid,
             container_statuses,
             timestamp,
         }

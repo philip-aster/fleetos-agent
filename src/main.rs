@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -26,11 +27,17 @@ async fn main() -> anyhow::Result<()> {
     let config = AgentConfig::load_from_file(&args.config)?;
     info!("Node ID: {}", config.node_id);
 
+    // Broadcast channel for graceful daemon shutdown signaling
+    let (shutdown_tx, _) = broadcast::channel::<()>(16);
+
     // Hardware Attestation via IdentityService
     let mock_attestor = fleetos_core::attestor::mock::MockHardwareAttestor::new();
     let boot_attestor = BootAttestor::new(config.control_plane_endpoint.clone());
 
-    let spiffe_id = match boot_attestor.authenticate_host(&mock_attestor).await {
+    let spiffe_id = match boot_attestor
+        .authenticate_host(&mock_attestor, &config.join_token)
+        .await
+    {
         Ok(id) => id,
         Err(e) => {
             error!(
@@ -67,19 +74,29 @@ async fn main() -> anyhow::Result<()> {
         pod_manager,
     );
 
+    let shutdown_rx1 = shutdown_tx.subscribe();
+    let shutdown_rx2 = shutdown_tx.subscribe();
+
     // Spawn identity & eBPF policy sync worker
-    tokio::spawn(async move {
-        sync_worker.run_sync_loop().await;
+    let sync_handle = tokio::spawn(async move {
+        sync_worker.run_sync_loop(shutdown_rx1).await;
     });
 
     // Spawn workload pod sync worker
-    tokio::spawn(async move {
-        workload_worker.run_sync_loop().await;
+    let workload_handle = tokio::spawn(async move {
+        workload_worker.run_sync_loop(shutdown_rx2).await;
     });
 
     info!("FleetOS Node Agent operational. Press Ctrl+C to stop.");
     tokio::signal::ctrl_c().await?;
     info!("Shutting down FleetOS Node Agent...");
 
+    // Notify background tasks to shut down
+    let _ = shutdown_tx.send(());
+
+    // Await background workers completion
+    let _ = tokio::join!(sync_handle, workload_handle);
+
+    info!("FleetOS Node Agent shutdown complete.");
     Ok(())
 }

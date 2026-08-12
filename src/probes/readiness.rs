@@ -2,36 +2,52 @@ use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio_vsock::{VsockAddr, VsockStream};
 use tracing::info;
 
 pub struct ReadinessProbe;
 
 impl ReadinessProbe {
-    /// Verifies if a container HTTP/TCP endpoint is ready to receive traffic
+    /// Verifies if a container or MicroVM HTTP endpoint is ready to receive traffic (2xx range match)
     pub async fn check_http(addr: SocketAddr, path: &str, timeout_dur: Duration) -> Result<bool> {
+        let url = format!("http://{}{}", addr, path);
+        let client = reqwest::Client::builder().timeout(timeout_dur).build()?;
+
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => Ok(true),
+            Ok(resp) => {
+                info!(
+                    "Readiness probe returned non-success status {} for {}",
+                    resp.status(),
+                    url
+                );
+                Ok(false)
+            }
+            Err(e) => {
+                info!("Readiness probe HTTP request failed for {}: {}", url, e);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Verifies guest application readiness over a Cloud Hypervisor VSOCK channel
+    pub async fn check_vsock(cid: u32, port: u32, timeout_dur: Duration) -> Result<bool> {
+        let addr = VsockAddr::new(cid, port);
         let res = timeout(timeout_dur, async {
-            let mut stream = TcpStream::connect(addr)
+            let mut stream = VsockStream::connect(addr)
                 .await
-                .context("Failed to connect to readiness target")?;
+                .context("Failed to connect to VSOCK readiness port")?;
 
-            let request = format!(
-                "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                path,
-                addr.ip()
-            );
+            // Write readiness ping byte sequence
+            stream.write_all(b"READY?\n").await?;
 
-            stream.write_all(request.as_bytes()).await?;
-
-            let mut response_buf = [0u8; 512];
+            let mut response_buf = [0u8; 64];
             let bytes_read = stream.read(&mut response_buf).await?;
 
             if bytes_read > 0 {
                 let response_text = String::from_utf8_lossy(&response_buf[..bytes_read]);
-                let is_ok =
-                    response_text.contains("200 OK") || response_text.contains("HTTP/1.1 2");
-                return Ok::<bool, anyhow::Error>(is_ok);
+                return Ok::<bool, anyhow::Error>(response_text.trim() == "OK");
             }
 
             Ok::<bool, anyhow::Error>(false)
@@ -41,11 +57,17 @@ impl ReadinessProbe {
         match res {
             Ok(Ok(ready)) => Ok(ready),
             Ok(Err(e)) => {
-                info!("Readiness probe check failed for {}: {}", addr, e);
+                info!(
+                    "VSOCK readiness probe failed for CID {}:port {}: {}",
+                    cid, port, e
+                );
                 Ok(false)
             }
             Err(_) => {
-                info!("Readiness probe timed out for {}", addr);
+                info!(
+                    "VSOCK readiness probe timed out for CID {}:port {}",
+                    cid, port
+                );
                 Ok(false)
             }
         }

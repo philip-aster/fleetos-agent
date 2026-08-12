@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use fleetos_ebpf_common::{EbpfPolicyKey, EbpfPolicyValue};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -32,22 +33,11 @@ impl NetworkManager {
         }
     }
 
-    /// Deterministic 128-bit hash derivation for SPIFFE identities
+    /// Truncated 128-bit BLAKE3 fingerprint for SPIFFE identity matching in eBPF maps
     fn hash_spiffe_id(spiffe_id: &str) -> [u8; 16] {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut h1 = DefaultHasher::new();
-        spiffe_id.hash(&mut h1);
-        let u1 = h1.finish();
-
-        let mut h2 = DefaultHasher::new();
-        format!("{}_salt", spiffe_id).hash(&mut h2);
-        let u2 = h2.finish();
-
+        let hash = blake3::hash(spiffe_id.as_bytes());
         let mut bytes = [0u8; 16];
-        bytes[..8].copy_from_slice(&u1.to_ne_bytes());
-        bytes[8..].copy_from_slice(&u2.to_ne_bytes());
+        bytes.copy_from_slice(&hash.as_bytes()[..16]);
         bytes
     }
 
@@ -73,6 +63,11 @@ impl NetworkManager {
         }
 
         Ok(())
+    }
+
+    /// Accessor for shared eBPF engine instance (for metrics/telemetry collectors)
+    pub async fn get_ebpf_engine(&self) -> Option<Arc<EbpfEngine>> {
+        self.ebpf_engine.read().await.clone()
     }
 
     /// Registers a local pod's IP and TAP device for same-node eBPF fast-path routing
@@ -167,6 +162,17 @@ impl NetworkManager {
     /// Prepares host TAP interface for Firecracker and Cloud Hypervisor MicroVM integration
     pub fn setup_tap_interface(&self, tap_name: &str) -> Result<()> {
         info!("Configuring network isolation on interface: {}", tap_name);
+
+        // Bring interface up via ip-link
+        let status = Command::new("ip")
+            .args(["link", "set", tap_name, "up"])
+            .status()
+            .with_context(|| format!("Failed to execute ip link set {} up", tap_name))?;
+
+        if !status.success() {
+            warn!("ip link set {} up returned non-zero exit code", tap_name);
+        }
+
         Ok(())
     }
 }

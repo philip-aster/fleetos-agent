@@ -5,7 +5,9 @@ use fleetos_core::proto::state::{
 };
 use fleetos_core::spiffe::SpiffeId;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tokio::time::{Duration, sleep};
+use tonic::transport::Endpoint;
 use tracing::{error, info, warn};
 
 use crate::pod::PodManager;
@@ -26,7 +28,7 @@ impl WorkloadSyncWorker {
     }
 
     /// Outer loop handles automatic reconnects with exponential backoff if fleetos-control drops
-    pub async fn run_sync_loop(&self) {
+    pub async fn run_sync_loop(&self, mut shutdown_rx: broadcast::Receiver<()>) {
         info!("Starting FleetOS Workload Pod Sync Worker...");
 
         let mut backoff = Duration::from_secs(1);
@@ -37,19 +39,27 @@ impl WorkloadSyncWorker {
                 self.control_plane_url
             );
 
-            match self.connect_and_stream().await {
-                Ok(_) => {
-                    info!("Pod watch stream closed gracefully by server. Reconnecting...");
-                    backoff = Duration::from_secs(1);
+            tokio::select! {
+                res = self.connect_and_stream() => {
+                    match res {
+                        Ok(_) => {
+                            info!("Pod watch stream closed gracefully by server. Reconnecting...");
+                            backoff = Duration::from_secs(1);
+                        }
+                        Err(e) => {
+                            error!(
+                                "WorkloadSync worker stream error: {}. Retrying in {}s...",
+                                e,
+                                backoff.as_secs()
+                            );
+                            sleep(backoff).await;
+                            backoff = (backoff * 2).min(Duration::from_secs(30));
+                        }
+                    }
                 }
-                Err(e) => {
-                    error!(
-                        "WorkloadSync worker stream error: {}. Retrying in {}s...",
-                        e,
-                        backoff.as_secs()
-                    );
-                    sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                _ = shutdown_rx.recv() => {
+                    info!("Shutting down WorkloadSyncWorker loop cleanly...");
+                    break;
                 }
             }
         }
@@ -57,7 +67,11 @@ impl WorkloadSyncWorker {
 
     /// Establishes the gRPC Watch stream and dispatches PodSpecs to PodManager
     async fn connect_and_stream(&self) -> Result<()> {
-        let mut client = StateServiceClient::connect(self.control_plane_url.clone())
+        let endpoint = Endpoint::from_shared(self.control_plane_url.clone())?
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30));
+
+        let mut client = StateServiceClient::connect(endpoint)
             .await
             .context("Failed to connect to fleetos-control StateService")?;
 
@@ -103,15 +117,14 @@ impl WorkloadSyncWorker {
                 },
                 EventType::Delete => {
                     let key_str = String::from_utf8_lossy(&watch_resp.key);
-                    let pod_id = key_str.split('/').last().unwrap_or("unknown");
+                    let pod_id = key_str.split('/').last().unwrap_or("unknown").to_string();
 
                     info!("Received Pod termination command for Pod ID: '{}'", pod_id);
                     let pod_manager = self.pod_manager.clone();
-                    let pod_id_owned = pod_id.to_string();
 
                     tokio::spawn(async move {
-                        if let Err(e) = pod_manager.terminate_pod(&pod_id_owned).await {
-                            error!("Failed to terminate Pod '{}': {}", pod_id_owned, e);
+                        if let Err(e) = pod_manager.terminate_pod(&pod_id).await {
+                            error!("Failed to terminate Pod '{}': {}", pod_id, e);
                         }
                     });
                 }

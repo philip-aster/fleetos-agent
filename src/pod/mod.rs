@@ -7,7 +7,7 @@ use fleetos_core::PodSpec;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::network::NetworkManager;
 use crate::runtime::RuntimeSupervisor;
@@ -36,6 +36,23 @@ impl PodManager {
         let pod_id = pod.id.clone();
         info!("PodManager: Spawning lifecycle worker for Pod '{}'", pod_id);
 
+        // If the pod is already running, terminate the old worker first to release TAP/eBPF resources cleanly
+        {
+            let mut pods = self.active_pods.write().await;
+            if let Some(old_handle) = pods.remove(&pod_id) {
+                warn!(
+                    "PodManager: Pod '{}' is already running. Stopping existing worker for update...",
+                    pod_id
+                );
+                if let Err(e) = old_handle.stop().await {
+                    warn!(
+                        "PodManager: Error stopping existing worker for '{}': {:?}",
+                        pod_id, e
+                    );
+                }
+            }
+        }
+
         let worker_handle = worker::spawn_pod_worker(
             pod,
             self.network_manager.clone(),
@@ -50,12 +67,27 @@ impl PodManager {
 
     /// Stops and terminates a running Pod (MicroVM or OCI task)
     pub async fn terminate_pod(&self, pod_id: &str) -> Result<()> {
-        let mut pods = self.active_pods.write().await;
-        if let Some(handle) = pods.remove(pod_id) {
+        let handle = {
+            let mut pods = self.active_pods.write().await;
+            pods.remove(pod_id)
+        };
+
+        if let Some(handle) = handle {
             info!("PodManager: Stopping Pod worker for '{}'", pod_id);
             handle.stop().await?;
+        } else {
+            warn!(
+                "PodManager: Requested termination for pod '{}', but it was not found active",
+                pod_id
+            );
         }
+
         Ok(())
+    }
+
+    /// Returns a list of active pod IDs running on this node
+    pub async fn list_pod_ids(&self) -> Vec<String> {
+        self.active_pods.read().await.keys().cloned().collect()
     }
 
     /// Returns the number of currently active pods managed on this host

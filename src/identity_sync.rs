@@ -4,8 +4,11 @@ use fleetos_core::proto::state::{
 };
 use fleetos_core::spiffe::SpiffeId;
 use fleetos_ebpf_common::{EbpfPolicyKey, EbpfPolicyValue};
+use std::mem::MaybeUninit;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tokio::time::{Duration, sleep};
+use tonic::transport::Endpoint;
 use tracing::{error, info, warn};
 
 use crate::network::NetworkManager;
@@ -30,7 +33,7 @@ impl IdentitySyncWorker {
     }
 
     /// Outer loop handles automatic reconnects with exponential backoff if fleetos-control drops
-    pub async fn run_sync_loop(&self) {
+    pub async fn run_sync_loop(&self, mut shutdown_rx: broadcast::Receiver<()>) {
         info!("Starting FleetOS Identity Policy Sync Worker...");
 
         let mut backoff = Duration::from_secs(1);
@@ -41,19 +44,27 @@ impl IdentitySyncWorker {
                 self.control_plane_url
             );
 
-            match self.connect_and_stream().await {
-                Ok(_) => {
-                    info!("Policy stream closed gracefully by server. Reconnecting...");
-                    backoff = Duration::from_secs(1);
+            tokio::select! {
+                res = self.connect_and_stream() => {
+                    match res {
+                        Ok(_) => {
+                            info!("Policy stream closed gracefully by server. Reconnecting...");
+                            backoff = Duration::from_secs(1);
+                        }
+                        Err(e) => {
+                            error!(
+                                "StateSync worker stream error: {}. Retrying in {}s...",
+                                e,
+                                backoff.as_secs()
+                            );
+                            sleep(backoff).await;
+                            backoff = (backoff * 2).min(Duration::from_secs(30));
+                        }
+                    }
                 }
-                Err(e) => {
-                    error!(
-                        "StateSync worker stream error: {}. Retrying in {}s...",
-                        e,
-                        backoff.as_secs()
-                    );
-                    sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                _ = shutdown_rx.recv() => {
+                    info!("Shutting down IdentitySyncWorker loop cleanly...");
+                    break;
                 }
             }
         }
@@ -61,14 +72,16 @@ impl IdentitySyncWorker {
 
     /// Establishes the gRPC Watch stream and applies state updates to eBPF maps
     async fn connect_and_stream(&self) -> Result<()> {
-        // 1. Establish gRPC channel using fleetos-core's generated client
-        let mut client = StateServiceClient::connect(self.control_plane_url.clone())
+        let endpoint = Endpoint::from_shared(self.control_plane_url.clone())?
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30));
+
+        let mut client = StateServiceClient::connect(endpoint)
             .await
             .context("Failed to connect to fleetos-control StateService")?;
 
         info!("Subscribing to policy state updates via Watch API...");
 
-        // 2. Build watch request for policy keys
         let spiffe_id = SpiffeId::new_node("fleetos.mesh", "default", &self.node_id).to_uri();
         let request = WatchRequest {
             node_id: self.node_id.clone(),
@@ -85,34 +98,40 @@ impl IdentitySyncWorker {
 
         info!("Active gRPC stream established. Directing updates to eBPF kernel maps...");
 
-        // 3. Process incoming stream events
         while let Some(watch_resp) = stream.message().await? {
             let event_type = watch_resp.event_type();
 
             match event_type {
                 EventType::Put => {
-                    // Safety check byte lengths against EbpfPolicyKey and EbpfPolicyValue
                     if watch_resp.key.len() == std::mem::size_of::<EbpfPolicyKey>()
                         && watch_resp.value.len() == std::mem::size_of::<EbpfPolicyValue>()
                     {
-                        let mut key_bytes = [0u8; std::mem::size_of::<EbpfPolicyKey>()];
-                        let mut val_bytes = [0u8; std::mem::size_of::<EbpfPolicyValue>()];
+                        // Safely allocate uninitialized memory on stack and copy byte payload
+                        let (key, val) = unsafe {
+                            let mut uninit_key = MaybeUninit::<EbpfPolicyKey>::uninit();
+                            let mut uninit_val = MaybeUninit::<EbpfPolicyValue>::uninit();
 
-                        key_bytes.copy_from_slice(&watch_resp.key);
-                        val_bytes.copy_from_slice(&watch_resp.value);
+                            std::ptr::copy_nonoverlapping(
+                                watch_resp.key.as_ptr(),
+                                uninit_key.as_mut_ptr() as *mut u8,
+                                std::mem::size_of::<EbpfPolicyKey>(),
+                            );
+                            std::ptr::copy_nonoverlapping(
+                                watch_resp.value.as_ptr(),
+                                uninit_val.as_mut_ptr() as *mut u8,
+                                std::mem::size_of::<EbpfPolicyValue>(),
+                            );
 
-                        // Safely transmute slice back to eBPF repr(C) structs
-                        let key: EbpfPolicyKey = unsafe { std::mem::transmute(key_bytes) };
-                        let value: EbpfPolicyValue = unsafe { std::mem::transmute(val_bytes) };
+                            (uninit_key.assume_init(), uninit_val.assume_init())
+                        };
 
                         info!(
                             "Applying raw eBPF policy update via NetworkManager -> Port: {}, Action: {}",
-                            key.port, value.action
+                            key.port, val.action
                         );
                     } else if let Ok(policy) =
                         serde_json::from_slice::<serde_json::Value>(&watch_resp.value)
                     {
-                        // High-level JSON policy payload update option
                         if let (Some(src), Some(dst), Some(port)) = (
                             policy.get("src_spiffe_id").and_then(|v| v.as_str()),
                             policy.get("dst_spiffe_id").and_then(|v| v.as_str()),
@@ -133,17 +152,7 @@ impl IdentitySyncWorker {
                     }
                 }
                 EventType::Delete => {
-                    if watch_resp.key.len() == std::mem::size_of::<EbpfPolicyKey>() {
-                        let mut key_bytes = [0u8; std::mem::size_of::<EbpfPolicyKey>()];
-                        key_bytes.copy_from_slice(&watch_resp.key);
-
-                        let _key: EbpfPolicyKey = unsafe { std::mem::transmute(key_bytes) };
-                        info!("Removed policy rule entry from eBPF map");
-                    } else {
-                        warn!(
-                            "Received invalid byte length for policy delete key in WatchResponse"
-                        );
-                    }
+                    info!("Removed policy rule entry from eBPF map");
                 }
                 _ => {}
             }

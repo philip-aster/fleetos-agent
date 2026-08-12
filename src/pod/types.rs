@@ -1,15 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-// Re-export core specs from fleetos_core so all agent submodules share ground truth types
-pub use fleetos_core::{CloudHypervisorConfig, PodSpec};
-
-/// Quality of Service class assigned to a Pod for resource scheduling & eviction
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum QosClass {
-    Guaranteed,
-    Burstable,
-    BestEffort,
-}
+// Re-export ground-truth core types from fleetos_core so all agent submodules share exact specs
+pub use fleetos_core::{CloudHypervisorConfig, PodRole, PodSpec, QosClass, RestartPolicy};
 
 /// Lifecycle state machine for Pod instances managed on this node
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +11,16 @@ pub enum PodPhase {
     Running,
     Failed(String),
     Terminated,
+}
+
+impl PodPhase {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, PodPhase::Failed(_) | PodPhase::Terminated)
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(self, PodPhase::Running)
+    }
 }
 
 /// Dynamic operational status of a Pod on this host

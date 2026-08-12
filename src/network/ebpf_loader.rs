@@ -81,15 +81,15 @@ impl EbpfEngine {
                 .context("POLICY_MAP not found in eBPF binary")?,
         )?;
 
-        if policy_map.get(key, 0).is_ok() {
-            policy_map.remove(key)?;
+        // Attempt direct atomic removal from kernel map
+        if policy_map.remove(key).is_ok() {
             info!("Kernel eBPF Policy Map Entry Removed -> Port: {}", key.port);
         }
 
         Ok(())
     }
 
-    /// Maps a local IPv4 address to its target TAP interface index for kernel fast-path redirection
+    /// Maps a local IPv4 address (converted to Network Byte Order) to its target TAP interface index
     pub async fn register_local_redirect(&self, ip: Ipv4Addr, if_index: u32) -> Result<()> {
         let mut ebpf = self.ebpf.lock().await;
         let mut local_map: AyaHashMap<_, u32, u32> = AyaHashMap::try_from(
@@ -97,12 +97,13 @@ impl EbpfEngine {
                 .context("LOCAL_POD_MAP not found in eBPF binary")?,
         )?;
 
-        let ip_u32 = u32::from(ip);
-        local_map.insert(ip_u32, if_index, 0)?;
+        // Ensure key matches network byte order as evaluated by BPF kernel packet parsing
+        let ip_be = u32::from(ip).to_be();
+        local_map.insert(ip_be, if_index, 0)?;
 
         info!(
-            "Kernel eBPF Local Redirect Map Registered -> IP: {} -> ifindex: {}",
-            ip, if_index
+            "Kernel eBPF Local Redirect Map Registered -> IP: {} (be: {:#x}) -> ifindex: {}",
+            ip, ip_be, if_index
         );
 
         Ok(())
@@ -116,9 +117,8 @@ impl EbpfEngine {
                 .context("LOCAL_POD_MAP not found in eBPF binary")?,
         )?;
 
-        let ip_u32 = u32::from(*ip);
-        if local_map.get(&ip_u32, 0).is_ok() {
-            local_map.remove(&ip_u32)?;
+        let ip_be = u32::from(*ip).to_be();
+        if local_map.remove(&ip_be).is_ok() {
             info!("Kernel eBPF Local Redirect Map Removed -> IP: {}", ip);
         }
 

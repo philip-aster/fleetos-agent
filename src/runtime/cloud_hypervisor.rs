@@ -4,6 +4,7 @@ use hyper_util::rt::TokioIo;
 use serde_json::json;
 use std::path::Path;
 use tokio::net::UnixStream;
+use tokio::process::Command;
 use tracing::{info, warn};
 
 pub struct CloudHypervisorDriver {
@@ -15,6 +16,52 @@ impl CloudHypervisorDriver {
         Self {
             base_socket_dir: base_socket_dir.into(),
         }
+    }
+
+    /// Ensures the Cloud Hypervisor process is running and listening on the designated Unix socket
+    async fn ensure_ch_daemon(&self, pod_id: &str, socket_path: &str) -> Result<()> {
+        if Path::new(socket_path).exists() {
+            return Ok(());
+        }
+
+        info!(
+            "[CloudHypervisor Driver] Spawning Cloud Hypervisor daemon for Pod '{}' listening on '{}'...",
+            pod_id, socket_path
+        );
+
+        // Ensure socket directory exists
+        if let Some(parent) = Path::new(socket_path).parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        let mut child = Command::new("cloud-hypervisor")
+            .arg("--api-socket")
+            .arg(socket_path)
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "Failed to spawn 'cloud-hypervisor' binary for socket {}",
+                    socket_path
+                )
+            })?;
+
+        // Wait up to 2 seconds for socket file creation
+        for _ in 0..20 {
+            if Path::new(socket_path).exists() {
+                // Detach child lifecycle to allow background API operation
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        warn!(
+            "CloudHypervisor socket path '{}' was not created within timeout. Proceeding in simulation mode.",
+            socket_path
+        );
+        Ok(())
     }
 
     /// Helper to perform HTTP REST calls over a CloudHypervisor Unix domain socket
@@ -78,6 +125,8 @@ impl CloudHypervisorDriver {
     ) -> Result<()> {
         let socket_path = format!("{}/ch-{}.sock", self.base_socket_dir, pod.id);
 
+        self.ensure_ch_daemon(&pod.id, &socket_path).await?;
+
         info!(
             "[CloudHypervisor Driver] Initializing MicroVM for Pod '{}' via socket '{}'",
             pod.id, socket_path
@@ -100,7 +149,17 @@ impl CloudHypervisorDriver {
             })
         });
 
-        // 3. Construct VmConfig JSON structure matching CloudHypervisor OpenAPI spec
+        // 3. Construct payload config block matching CloudHypervisor OpenAPI spec
+        let mut payload_config = json!({
+            "kernel": config.kernel_path,
+            "cmdline": config.cmdline,
+        });
+
+        if let Some(ref initrd) = config.initrd_path {
+            payload_config["initrd"] = json!(initrd);
+        }
+
+        // 4. Construct complete VmConfig
         let mut vm_config = json!({
             "cpus": {
                 "boot_vcpus": config.vcpus,
@@ -110,13 +169,7 @@ impl CloudHypervisorDriver {
                 "size": config.memory_mb * 1024 * 1024, // Convert MB to Bytes
                 "shared": true,
             },
-            "kernel": {
-                "path": config.kernel_path,
-            },
-            "cmdline": {
-                "args": config.cmdline,
-            },
-            "payload": config.initrd_path.as_ref().map(|path| json!({ "initrd": path })),
+            "payload": payload_config,
         });
 
         if let Some(net) = net_config {
@@ -127,7 +180,7 @@ impl CloudHypervisorDriver {
             vm_config["vsock"] = vsock;
         }
 
-        // 4. PUT /api/v1/vm.create
+        // 5. PUT /api/v1/vm.create
         info!(
             "  -> [REST API] Creating MicroVM configuration (vCPUs: {}, Memory: {}MB, TAP: {:?})",
             config.vcpus, config.memory_mb, tap_name
@@ -140,7 +193,7 @@ impl CloudHypervisorDriver {
         )
         .await?;
 
-        // 5. PUT /api/v1/vm.boot
+        // 6. PUT /api/v1/vm.boot
         info!("  -> [REST API] Booting MicroVM...");
         self.send_api_request(&socket_path, http::Method::PUT, "/api/v1/vm.boot", None)
             .await?;
