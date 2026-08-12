@@ -7,9 +7,9 @@ use fleetos_agent::{
     attestation::BootAttestor,
     config::{AgentConfig, Cli},
     identity_sync::IdentitySyncWorker,
-    network::ebpf_loader::EbpfEngine,
-    network_manager::NetworkManager,
-    runtime::RuntimeDriver,
+    network::NetworkManager,
+    pod::PodManager,
+    runtime::RuntimeSupervisor,
     workload_sync::WorkloadSyncWorker,
 };
 
@@ -41,26 +41,30 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let _net_mgr = NetworkManager::new();
+    // Initialize NetworkManager for local fast-path eBPF routing
+    let network_manager = Arc::new(NetworkManager::new(&config.network_interface));
+    if let Err(e) = network_manager.initialize_ebpf().await {
+        error!("Failed to initialize eBPF engine: {:?}", e);
+    }
 
-    // Load embedded eBPF programs into host kernel
-    let ebpf_engine = Arc::new(EbpfEngine::load_and_attach(&config.network_interface)?);
+    // Initialize RuntimeSupervisor (Containerd + CloudHypervisor drivers)
+    let runtime_supervisor = Arc::new(RuntimeSupervisor::new());
 
-    // Initialize RuntimeDriver (Containerd + CloudHypervisor)
-    let runtime_driver = Arc::new(RuntimeDriver::new());
+    // Initialize PodManager with network manager and runtime supervisor
+    let pod_manager = Arc::new(PodManager::new(network_manager.clone(), runtime_supervisor));
 
     // Initialize IdentitySyncWorker
     let sync_worker = IdentitySyncWorker::new(
         config.control_plane_endpoint.clone(),
         spiffe_id.clone(),
-        ebpf_engine.clone(),
+        network_manager.clone(),
     );
 
     // Initialize WorkloadSyncWorker
     let workload_worker = WorkloadSyncWorker::new(
         config.control_plane_endpoint.clone(),
         config.node_id.clone(),
-        runtime_driver,
+        pod_manager,
     );
 
     // Spawn identity & eBPF policy sync worker

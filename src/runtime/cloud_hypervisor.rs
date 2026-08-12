@@ -68,8 +68,14 @@ impl CloudHypervisorDriver {
         Ok(())
     }
 
-    /// Builds payload and boots a MicroVM for the given PodSpec
-    pub async fn boot_vm(&self, pod: &PodSpec, config: &CloudHypervisorConfig) -> Result<()> {
+    /// Builds payload and boots a MicroVM attached to a target TAP interface and VSOCK CID
+    pub async fn boot_vm(
+        &self,
+        pod: &PodSpec,
+        config: &CloudHypervisorConfig,
+        tap_name: Option<&str>,
+        assigned_ip: Option<&str>,
+    ) -> Result<()> {
         let socket_path = format!("{}/ch-{}.sock", self.base_socket_dir, pod.id);
 
         info!(
@@ -77,8 +83,25 @@ impl CloudHypervisorDriver {
             pod.id, socket_path
         );
 
-        // 1. Construct VmConfig JSON structure matching CloudHypervisor OpenAPI spec
-        let vm_config = json!({
+        // 1. Construct network device payload if TAP is configured
+        let net_config = tap_name.map(|tap| {
+            vec![json!({
+                "tap": tap,
+                "ip": assigned_ip.unwrap_or("10.244.0.2"),
+                "mask": "255.255.255.0",
+            })]
+        });
+
+        // 2. Construct VSOCK configuration for host-guest control proxying if CID is specified
+        let vsock_config = config.vsock_cid.map(|cid| {
+            json!({
+                "cid": cid,
+                "socket": format!("{}/vsock-{}.sock", self.base_socket_dir, pod.id),
+            })
+        });
+
+        // 3. Construct VmConfig JSON structure matching CloudHypervisor OpenAPI spec
+        let mut vm_config = json!({
             "cpus": {
                 "boot_vcpus": config.vcpus,
                 "max_vcpus": config.vcpus,
@@ -96,10 +119,18 @@ impl CloudHypervisorDriver {
             "payload": config.initrd_path.as_ref().map(|path| json!({ "initrd": path })),
         });
 
-        // 2. PUT /api/v1/vm.create
+        if let Some(net) = net_config {
+            vm_config["net"] = json!(net);
+        }
+
+        if let Some(vsock) = vsock_config {
+            vm_config["vsock"] = vsock;
+        }
+
+        // 4. PUT /api/v1/vm.create
         info!(
-            "  -> [REST API] Creating MicroVM configuration (vCPUs: {}, Memory: {}MB)",
-            config.vcpus, config.memory_mb
+            "  -> [REST API] Creating MicroVM configuration (vCPUs: {}, Memory: {}MB, TAP: {:?})",
+            config.vcpus, config.memory_mb, tap_name
         );
         self.send_api_request(
             &socket_path,
@@ -109,7 +140,7 @@ impl CloudHypervisorDriver {
         )
         .await?;
 
-        // 3. PUT /api/v1/vm.boot
+        // 5. PUT /api/v1/vm.boot
         info!("  -> [REST API] Booting MicroVM...");
         self.send_api_request(&socket_path, http::Method::PUT, "/api/v1/vm.boot", None)
             .await?;

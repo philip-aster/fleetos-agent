@@ -25,7 +25,6 @@ impl ContainerdDriver {
     async fn connect(&self) -> Result<Channel> {
         let socket_path = self.socket_path.clone();
 
-        // Connect over Unix domain socket using hyper-util service_fn
         let channel = Endpoint::try_from("http://[::]:50051")?
             .connect_with_connector(service_fn(move |_: Uri| {
                 let path = socket_path.clone();
@@ -46,6 +45,8 @@ impl ContainerdDriver {
         &self,
         pod: &PodSpec,
         config: &ContainerdConfig,
+        veth_host_iface: Option<&str>,
+        assigned_ip: Option<&str>,
     ) -> Result<()> {
         if !Path::new(&self.socket_path).exists() {
             warn!(
@@ -61,12 +62,18 @@ impl ContainerdDriver {
         }
 
         info!(
-            "[Containerd Engine] Spawning Pod '{}' in namespace '{}' (Snapshotter: '{}', Runtime: '{}')",
-            pod.id, pod.namespace, config.snapshotter, config.runtime_type
+            "[Containerd Engine] Spawning Pod '{}' in namespace '{}' (Snapshotter: '{}', Runtime: '{}', veth: {:?}, IP: {:?})",
+            pod.id,
+            pod.namespace,
+            config.snapshotter,
+            config.runtime_type,
+            veth_host_iface,
+            assigned_ip
         );
 
         for container in &pod.containers {
-            self.spawn_container_task(pod, container, config).await?;
+            self.spawn_container_task(pod, container, config, veth_host_iface, assigned_ip)
+                .await?;
         }
 
         Ok(())
@@ -77,16 +84,42 @@ impl ContainerdDriver {
         pod: &PodSpec,
         container: &ContainerSpec,
         config: &ContainerdConfig,
+        veth_host_iface: Option<&str>,
+        assigned_ip: Option<&str>,
     ) -> Result<()> {
         info!(
             "  -> [Container Task] Pulling image '{}' via snapshotter '{}'",
             container.image, config.snapshotter
         );
 
+        // Inject SPIFFE Identity & Network metadata into OCI container specs
+        let mut env_vars = container.env.clone();
+        if let Some(spiffe_id) = &pod.role.spiffe_id {
+            env_vars.insert("SPIFFE_ID".to_string(), spiffe_id.clone());
+            env_vars.insert(
+                "SPIFFE_ENDPOINT_SOCKET".to_string(),
+                "/run/fleetos/agent.sock".to_string(),
+            );
+        }
+
+        if let Some(ip) = assigned_ip {
+            env_vars.insert("POD_IP".to_string(), ip.to_string());
+        }
+
         info!(
-            "  -> [Container Task] Creating OCI container '{}/{}' with args: {:?}",
-            pod.id, container.name, container.args
+            "  -> [Container Task] Creating OCI container '{}/{}' with args: {:?}, env vars: {}",
+            pod.id,
+            container.name,
+            container.args,
+            env_vars.len()
         );
+
+        if let Some(iface) = veth_host_iface {
+            info!(
+                "  -> [Network Binding] Attached OCI netns to host interface '{}'",
+                iface
+            );
+        }
 
         info!(
             "  -> [Container Task] Task started for '{}/{}' (privileged: {})",

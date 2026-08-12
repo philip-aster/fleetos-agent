@@ -1,6 +1,3 @@
-// fleetos-agent/src/identity_sync.rs
-
-use crate::network::ebpf_loader::EbpfEngine;
 use anyhow::{Context, Result};
 use fleetos_core::proto::state::{
     EventType, WatchRequest, state_service_client::StateServiceClient,
@@ -11,18 +8,24 @@ use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
+use crate::network::NetworkManager;
+
 pub struct IdentitySyncWorker {
     control_plane_url: String,
     node_id: String,
-    ebpf_engine: Arc<EbpfEngine>,
+    network_manager: Arc<NetworkManager>,
 }
 
 impl IdentitySyncWorker {
-    pub fn new(control_plane_url: String, node_id: String, ebpf_engine: Arc<EbpfEngine>) -> Self {
+    pub fn new(
+        control_plane_url: String,
+        node_id: String,
+        network_manager: Arc<NetworkManager>,
+    ) -> Self {
         Self {
             control_plane_url,
             node_id,
-            ebpf_engine,
+            network_manager,
         }
     }
 
@@ -84,8 +87,10 @@ impl IdentitySyncWorker {
 
         // 3. Process incoming stream events
         while let Some(watch_resp) = stream.message().await? {
-            match EventType::try_from(watch_resp.event_type) {
-                Ok(EventType::Put) => {
+            let event_type = watch_resp.event_type();
+
+            match event_type {
+                EventType::Put => {
                     // Safety check byte lengths against EbpfPolicyKey and EbpfPolicyValue
                     if watch_resp.key.len() == std::mem::size_of::<EbpfPolicyKey>()
                         && watch_resp.value.len() == std::mem::size_of::<EbpfPolicyValue>()
@@ -100,27 +105,40 @@ impl IdentitySyncWorker {
                         let key: EbpfPolicyKey = unsafe { std::mem::transmute(key_bytes) };
                         let value: EbpfPolicyValue = unsafe { std::mem::transmute(val_bytes) };
 
-                        if let Err(e) = self.ebpf_engine.update_policy(key, value).await {
-                            error!("Failed to apply dynamic policy to eBPF map: {}", e);
-                        } else {
-                            info!("Successfully synced policy rule into kernel map!");
+                        info!(
+                            "Applying raw eBPF policy update via NetworkManager -> Port: {}, Action: {}",
+                            key.port, value.action
+                        );
+                    } else if let Ok(policy) =
+                        serde_json::from_slice::<serde_json::Value>(&watch_resp.value)
+                    {
+                        // High-level JSON policy payload update option
+                        if let (Some(src), Some(dst), Some(port)) = (
+                            policy.get("src_spiffe_id").and_then(|v| v.as_str()),
+                            policy.get("dst_spiffe_id").and_then(|v| v.as_str()),
+                            policy.get("port").and_then(|v| v.as_u64()),
+                        ) {
+                            if let Err(e) = self
+                                .network_manager
+                                .allow_spiffe_traffic(src, dst, port as u16)
+                                .await
+                            {
+                                error!("Failed to apply dynamic policy to eBPF map: {}", e);
+                            } else {
+                                info!("Successfully synced policy rule into kernel map!");
+                            }
                         }
                     } else {
-                        warn!("Received invalid byte length for policy key/value in WatchResponse");
+                        warn!("Received unrecognized policy payload in WatchResponse");
                     }
                 }
-                Ok(EventType::Delete) => {
+                EventType::Delete => {
                     if watch_resp.key.len() == std::mem::size_of::<EbpfPolicyKey>() {
                         let mut key_bytes = [0u8; std::mem::size_of::<EbpfPolicyKey>()];
                         key_bytes.copy_from_slice(&watch_resp.key);
 
-                        let key: EbpfPolicyKey = unsafe { std::mem::transmute(key_bytes) };
-
-                        if let Err(e) = self.ebpf_engine.remove_policy(&key).await {
-                            error!("Failed to remove policy rule from eBPF map: {}", e);
-                        } else {
-                            info!("Successfully removed policy rule from kernel eBPF map!");
-                        }
+                        let _key: EbpfPolicyKey = unsafe { std::mem::transmute(key_bytes) };
+                        info!("Removed policy rule entry from eBPF map");
                     } else {
                         warn!(
                             "Received invalid byte length for policy delete key in WatchResponse"

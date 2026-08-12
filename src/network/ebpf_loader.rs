@@ -5,6 +5,7 @@ use aya::{
     programs::{SchedClassifier, TcAttachType, tc},
 };
 use fleetos_ebpf_common::{EbpfPolicyKey, EbpfPolicyValue};
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -83,6 +84,42 @@ impl EbpfEngine {
         if policy_map.get(key, 0).is_ok() {
             policy_map.remove(key)?;
             info!("Kernel eBPF Policy Map Entry Removed -> Port: {}", key.port);
+        }
+
+        Ok(())
+    }
+
+    /// Maps a local IPv4 address to its target TAP interface index for kernel fast-path redirection
+    pub async fn register_local_redirect(&self, ip: Ipv4Addr, if_index: u32) -> Result<()> {
+        let mut ebpf = self.ebpf.lock().await;
+        let mut local_map: AyaHashMap<_, u32, u32> = AyaHashMap::try_from(
+            ebpf.map_mut("LOCAL_POD_MAP")
+                .context("LOCAL_POD_MAP not found in eBPF binary")?,
+        )?;
+
+        let ip_u32 = u32::from(ip);
+        local_map.insert(ip_u32, if_index, 0)?;
+
+        info!(
+            "Kernel eBPF Local Redirect Map Registered -> IP: {} -> ifindex: {}",
+            ip, if_index
+        );
+
+        Ok(())
+    }
+
+    /// Removes a local IPv4 fast-path entry when a pod is terminated
+    pub async fn remove_local_redirect(&self, ip: &Ipv4Addr) -> Result<()> {
+        let mut ebpf = self.ebpf.lock().await;
+        let mut local_map: AyaHashMap<_, u32, u32> = AyaHashMap::try_from(
+            ebpf.map_mut("LOCAL_POD_MAP")
+                .context("LOCAL_POD_MAP not found in eBPF binary")?,
+        )?;
+
+        let ip_u32 = u32::from(*ip);
+        if local_map.get(&ip_u32, 0).is_ok() {
+            local_map.remove(&ip_u32)?;
+            info!("Kernel eBPF Local Redirect Map Removed -> IP: {}", ip);
         }
 
         Ok(())

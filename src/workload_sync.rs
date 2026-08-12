@@ -1,4 +1,3 @@
-use crate::runtime::RuntimeDriver;
 use anyhow::{Context, Result};
 use fleetos_core::PodSpec;
 use fleetos_core::proto::state::{
@@ -9,18 +8,20 @@ use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
+use crate::pod::PodManager;
+
 pub struct WorkloadSyncWorker {
     control_plane_url: String,
     node_id: String,
-    runtime: Arc<RuntimeDriver>,
+    pod_manager: Arc<PodManager>,
 }
 
 impl WorkloadSyncWorker {
-    pub fn new(control_plane_url: String, node_id: String, runtime: Arc<RuntimeDriver>) -> Self {
+    pub fn new(control_plane_url: String, node_id: String, pod_manager: Arc<PodManager>) -> Self {
         Self {
             control_plane_url,
             node_id,
-            runtime,
+            pod_manager,
         }
     }
 
@@ -54,7 +55,7 @@ impl WorkloadSyncWorker {
         }
     }
 
-    /// Establishes the gRPC Watch stream and dispatches PodSpecs to Containerd/CloudHypervisor
+    /// Establishes the gRPC Watch stream and dispatches PodSpecs to PodManager
     async fn connect_and_stream(&self) -> Result<()> {
         let mut client = StateServiceClient::connect(self.control_plane_url.clone())
             .await
@@ -67,7 +68,7 @@ impl WorkloadSyncWorker {
             node_id: self.node_id.clone(),
             spiffe_id,
             start_revision: 0,
-            key_prefix: format!("/pods/{}", self.node_id).into_bytes(),
+            key_prefix: format!("/pods/assigned/{}/", self.node_id).into_bytes(),
         };
 
         let mut stream = client
@@ -76,17 +77,19 @@ impl WorkloadSyncWorker {
             .context("Failed to open Watch stream on control plane")?
             .into_inner();
 
-        info!("Active gRPC stream established. Directing Pod assignments to runtime drivers...");
+        info!("Active gRPC stream established. Directing Pod assignments to PodManager...");
 
         while let Some(watch_resp) = stream.message().await? {
-            match EventType::try_from(watch_resp.event_type) {
-                Ok(EventType::Put) => match serde_json::from_slice::<PodSpec>(&watch_resp.value) {
+            let event_type = watch_resp.event_type();
+
+            match event_type {
+                EventType::Put => match serde_json::from_slice::<PodSpec>(&watch_resp.value) {
                     Ok(pod) => {
                         info!("Received Pod dispatch assignment: '{}'", pod.id);
-                        let runtime = self.runtime.clone();
+                        let pod_manager = self.pod_manager.clone();
 
                         tokio::spawn(async move {
-                            if let Err(e) = runtime.spawn_pod(&pod).await {
+                            if let Err(e) = pod_manager.spawn_pod(pod.clone()).await {
                                 error!("Failed to spawn Pod '{}': {}", pod.id, e);
                             }
                         });
@@ -98,17 +101,17 @@ impl WorkloadSyncWorker {
                         );
                     }
                 },
-                Ok(EventType::Delete) => {
+                EventType::Delete => {
                     let key_str = String::from_utf8_lossy(&watch_resp.key);
                     let pod_id = key_str.split('/').last().unwrap_or("unknown");
 
                     info!("Received Pod termination command for Pod ID: '{}'", pod_id);
-                    let runtime = self.runtime.clone();
+                    let pod_manager = self.pod_manager.clone();
                     let pod_id_owned = pod_id.to_string();
 
                     tokio::spawn(async move {
-                        if let Err(e) = runtime.stop_pod(&pod_id_owned).await {
-                            error!("Failed to stop Pod '{}': {}", pod_id_owned, e);
+                        if let Err(e) = pod_manager.terminate_pod(&pod_id_owned).await {
+                            error!("Failed to terminate Pod '{}': {}", pod_id_owned, e);
                         }
                     });
                 }
