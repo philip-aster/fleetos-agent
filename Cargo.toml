@@ -2,36 +2,8 @@
 name = "fleetos-agent"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+authors = ["Philip Aster and the FleetOS Contributors"]
+description = "High-priviledge Node Agent running on every FleetOS Worker Node"
 
 [dependencies]
-anyhow = "1.0.104"
-aya = "0.14.0"
-aya-log = "0.3.0"
-clap = { version = "4.6.6", features = ["derive", "env"] }
-serde = { version = "1.0.229", features = ["derive"] }
-tokio = { version = "1.53.1", features = ["full"] }
-toml = "1.1.4"
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-fleetos-core = { version = "0.1.0", path = "../fleetos-core" }
-fleetos-control = { version = "0.1.0", path = "../fleetos-control" }
-fleetos-ebpf-common = { version = "0.1.0", path = "../fleetos-ebpf/fleetos-ebpf-common", features = ["user"] }
-serde_json = "1.0.151"
-tonic = "0.14.6"
-tower = { version = "0.5.3", features = ["util"] }
-hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "tokio", "http1"] }
-http = "1.5.0"
-http-body-util = "0.1.4"
-hyper = { version = "1.11.0", features = ["full"] }
-blake3 = "1.8.6"
-tokio-vsock = "0.7.2"
-reqwest = "0.13.4"
-rand = "0.10.2"
-
-[build-dependencies]
-tonic-build = "0.14.6"
-
-[dev-dependencies]
-fleetos-agent = { path = "." }
-fleetos-control = { path = "../fleetos-control", features = ["test-helpers"] }
-tempfile = "3.27.0"
