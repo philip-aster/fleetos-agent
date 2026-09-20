@@ -5,7 +5,7 @@ fleetos-agent/
 ├── Cargo.toml                        # Batch 1 — deps pinned to core v0.2.0-rc-5 / ebpf v0.1.3-rc-3
 ├── agent.example.toml                # Batch 1 — reference config, secure-mode defaults
 ├── README.md                         # Batch 1 — build/run notes, object-path expectation (AA-8)
-├── fleetos-agent-addendum.md         # Living document — rulings A–G, audit findings, upstream blockers
+├── fleetos-agent-ledger.md           # Living document — rulings A–G, audit findings, upstream blockers
 │
 ├── src/
 │   ├── main.rs                       # Batch 1 skeleton → Batch 12 full wiring
@@ -113,7 +113,7 @@ Delivery model unchanged: **one batch per message from me**, complete file conte
 
 | File | Purpose |
 |---|---|
-| `Cargo.toml` | Deps: `fleetos-core` (features: `tpm`, `ca`, `vsock-attest`), `fleetos-ebpf-common`, `aya 0.14.x`, `tonic 0.14.x`, `tokio`, `fjall`, `postcard`, `tss-esapi`, `zeroize`, `blake3`, etc. `fleetos-policy-compiler` commented out with a Ruling-A note. |
+| `Cargo.toml` | Deps: `fleetos-core` (features: `production`), `fleetos-ebpf-common`, `fleetos-policy-compiler` (Ruling A resolved), `aya 0.14.x`, `tonic 0.14.x`, `tokio`, `fjall`, `postcard`, `tss-esapi`, `zeroize`, `blake3`, etc. Added `dev` feature gated by `fleetos_dev` cfg. |
 | `lib.rs` / `main.rs` | Module declarations; `main` prints config path and exits cleanly. |
 | `error.rs` | `AgentError` incl. `PendingUpstream(&'static str)`. |
 | `config.rs` | `AgentConfig`: node, control addr, join (mode/token/bundle path/PCR indices), tpm backend, storage path, ebpf (object path, cgroup, pin path, headroom), svid refresh, vsock attest (listen addr, boot-artifact paths). Validation + loud insecure-mode warning. |
@@ -259,9 +259,133 @@ Delivery model unchanged: **one batch per message from me**, complete file conte
 - **Gate:** `cargo check`, `cargo test`, then a **manual smoke procedure** on a dev node: config loads, join fails cleanly without a control plane, eBPF object loads if present, VSOCK listener binds, clean shutdown.
 
 
+---
 
-### Ledger Entries
+
+# fleetos-agent — Living Ledger
+
+## Rulings
+
+### Ruling A — SAG compiler extraction (RESOLVED)
+The SAG→eBPF compilation logic has been successfully extracted into the shared
+`fleetos-policy-compiler` crate. The agent now depends on it directly.
+Batch 5 will wire the real compiler instead of the `policy/stub.rs` fail-closed stub. 
+When I require the source, I should ask the PM.
+
+### Ruling B — Watch streams carry no initial-state frame
+`WatchSag`/`WatchSchedule`/`WatchRoutes`/`WatchEvents` emit only on change,
+nothing on subscribe. On agent restart in a quiet cluster the agent comes up
+with empty policy/routes/schedule. Default-deny is fail-safe, but it's a
+policy vacuum until the next mutation. Decision pending: initial full-state
+frame on subscribe, or unary state-fetch RPC.
+
+### Ruling C — Policy-map sizing
+The handoff says maps are "sized generously by fleetos-agent at load time,"
+but the current `fleetos-ebpf` source hardcodes sizes in `HashMap::pinned(...)`.
+Confirm whether the agent is expected to resize/own these at load, and
+reconcile with the source.
+
+### Ruling D — Readiness gate
+A pod does not transition to `Running` until (container/MicroVM started) AND
+(`policy_enforced`) AND (router connectivity confirmed). The `policy_enforced`
+field is TODO until the `state.proto` change lands (CR-CORE-3).
+
+### Ruling E — Dummy-IP resolution mechanism
+Options: local stub resolver, NSS module, or `/etc/hosts` injection.
+Not yet decided. v1 uses `/etc/hosts` injection (static).
+
+### Ruling F — `sock_ops` vs identity-header ordering
+Whether `sock_ops` fires before or after the application-level identity
+header is visible on a local connection. Determines the same-node fast-path
+implementation. Unresolved.
+
+### Ruling G — TPM-sealed storage for sensitive keys (CR-CORE-5)
+The agent's X25519 sealing private key (and any delegated signing keys)
+must never sit in plaintext in fjall. The key is generated pre-attestation
+and must survive restarts. It must be persisted TPM-sealed (bound to the
+node's PCR state). `fleetos_core::attestation::tpm::seal_to_pcr` /
+`unseal` landed in core v0.2.0-rc-5.
+
+## Audit Findings
+
+### AA-1 — Missing client exports in core
+Core's `proto.rs` exports server types for `PolicyService`, `SchedulerService`,
+`WatchService`, and `SecretService`, but only exports clients for
+`WorkloadStatusServiceClient` and `DelegationServiceClient`. The agent
+additionally needs clients for `WatchSag`, `WatchSchedule`, `WatchEvents`,
+and `FetchSecret`. Filed as CR-CORE-4.
+
+### AA-2 — SockTuple key mismatch breaks same-node fast path
+In `fleetos-ebpf/src/main.rs`, `fleetos_connect4` inserts `SOCK_STATE_MAP`
+keyed with `src_port = HostOrderPort(0)` and the original dummy `dst_ip`,
+while `fleetos_sockops` builds its lookup tuple from the post-rewrite
+endpoints. These keys can never match, so `SOCKHASH` bypass never fires.
+Fix belongs to the eBPF Lead. The agent's `LOCAL_WORKLOADS` design is
+affected but not blocked.
+
+### AA-3 — Pinned maps vs resize
+The eBPF source hardcodes map sizes in `HashMap::pinned(...)`. If the agent
+is expected to resize maps at load time (Ruling C), the pin lifecycle needs
+reconciliation: stale-pin removal, controlled-reload trigger on map exhaustion.
+
+### AA-4 — Core sealing primitive
+`fleetos_core::attestation::tpm::seal_to_pcr` / `unseal` landed in
+core v0.2.0-rc-5 (CR-CORE-5). PCR-binding policy is caller-supplied.
+The agent must decide which PCRs to bind at seal time.
+
+### AA-6 — Insecure join structural quote
+The insecure join flow uses a structural `TpmQuote` (postcard-encoded into
+`raw_quote`). The quote is never cryptographically verified. Fenced exactly
+like control's R-1: compiled out of production builds; refuses at runtime
+otherwise.
+
+### AA-7 — LOCAL_WORKLOADS mirrored as HashMap
+`LOCAL_WORKLOADS` is mirrored in userspace as `HashMap<IdentityFingerprint, u8>`
+for fast lookup without a map probe. The kernel map is the source of truth;
+the userspace mirror is a cache that must be kept in sync.
+
+### AA-8 — eBPF object path expectation
+The agent expects the compiled eBPF object at `ebpf.object_path`. The object
+must be built from the `fleetos-ebpf` workspace with the exact toolchain
+documented in its README. Version mismatch between the agent's expected ABI
+and the object's actual ABI is a hard failure.
+
+## Upstream Blockers
+
+### G1 — WorkloadAssignment is too thin to boot a pod
+`state.proto` streams only `workload_id, runtime, image, role`. Missing
+`pod_id`, `ordinal`, resources, volumes, probes, env, ports, termination.
+Filed as CR-CORE-1. Agent cannot implement Batch 10 correctly until this lands.
+
+### G2 — Volume sources don't exist
+`VolumeMount` without a `Volume` definition is a mount with nothing to mount.
+Filed as CR-CORE-2. Agent's `workloads/volumes/` module is stubbed until
+the schema lands.
+
+### G3 — WorkloadStatusReport needs restart_count, started, policy_enforced
+Filed as CR-CORE-3. Agent's `workloads/status.rs` builder is structured so
+these fields are a one-line wire when the proto change lands.
+
+### G4 — Drain semantics
+`EvictNode` removes placements → full-state schedule frame omits them →
+agent terminates gracefully. Coherent but undocumented. No `DrainNode` RPC,
+no PDB equivalent.
+
+### G6 — Pod lifecycle events
+No pod-scoped event stream. Filed as CR-CORE-8 / CR-CTRL-7. Agent's
+`observability/pod_events.rs` is stubbed until the proto lands.
+
+### Question H — Readiness → routing coupling
+In K8s, an unready pod is removed from endpoints. In FleetOS, who enforces
+that? The dummy-IP route table is Raft-replicated from placements, not
+readiness. Needs an architect ruling.
+
+### Work Ledger Entries
 
 | Work Item | Status |
-|---|---|
-| Created Initial Scafolding: Initial scaffolding for the FleetOS Node Agent, revised directory structure. | Done |
+| ---|---|
+| Created Initial Scafolding: Initial scaffolding for the FleetOS Node Agent, revised directory structure. | Complete |
+| Batch 1: Skeleton | Complete |
+| Add `dev` feature with `fleetos_dev` cfg guard and `production` feature flag. | Complete |
+| Update `Cargo.toml` to use `fleetos-core` `production` feature and link `fleetos-policy-compiler`. | Complete |
+| Update `fleetos-agent-ledger.md` to mark Ruling A as RESOLVED. | Complete |
