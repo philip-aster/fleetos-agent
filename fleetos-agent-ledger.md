@@ -43,7 +43,6 @@ fleetos-agent/
 │   │
 │   ├── policy/
 │   │   ├── mod.rs                    # Batch 5 — SagCompiler trait boundary + CompiledPolicyEntry
-│   │   ├── stub.rs                   # Batch 5 — CompilerNotYetAvailable → PendingUpstream (Ruling A blocker)
 │   │   └── sync.rs                   # Batch 5 — full-state policy sync: desired-set diff, stale sweep, reload-on-exhaustion trigger
 │   │
 │   ├── routes/
@@ -392,3 +391,4 @@ readiness. Needs an architect ruling.
 | Batch 2: Identity State and Storage | Complete |
 | Batch 3: Control client (the redirect-and-retry foundation) | Complete |
 | Batch 4: BPF loader lifecycle + counters reader | Complete |
+| Batch 5: Policy Boundary | Complete |

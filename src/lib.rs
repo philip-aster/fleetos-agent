@@ -24,8 +24,7 @@ pub mod client;
 
 pub mod ebpf;
 
-// Batch 5 — Policy boundary
-// pub mod policy;
+pub mod policy;
 
 // Batch 6 — Routes & name resolution
 // pub mod routes;
