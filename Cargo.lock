@@ -974,6 +974,7 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "aya",
+ "base64 0.23.1",
  "blake3",
  "bytemuck",
  "clap",

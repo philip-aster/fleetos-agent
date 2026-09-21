@@ -20,8 +20,7 @@ pub mod error;
 pub mod identity;
 pub mod storage;
 
-// Batch 3 — Control client
-// pub mod client;
+pub mod client;
 
 // Batch 4 — eBPF loader lifecycle
 // pub mod ebpf;

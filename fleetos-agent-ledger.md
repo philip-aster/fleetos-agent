@@ -390,3 +390,4 @@ readiness. Needs an architect ruling.
 | Update `Cargo.toml` to use `fleetos-core` `production` feature and link `fleetos-policy-compiler`. | Complete |
 | Update `fleetos-agent-ledger.md` to mark Ruling A as RESOLVED. | Complete |
 | Batch 2: Identity State and Storage | Complete |
+| Batch 3: Control client (the redirect-and-retry foundation) | Complete |

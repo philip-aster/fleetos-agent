@@ -44,6 +44,7 @@ serde_json = "1.0.151"
 toml = "1.1.6"
 
 # --- Crypto / identity ---
+base64 = "0.23.1"
 blake3 = "1.8.7"
 rand = "0.10.3"
 zeroize = { version = "1.9.0", features = ["derive"] }
