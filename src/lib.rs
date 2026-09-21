@@ -17,9 +17,8 @@ compile_error!(
 pub mod config;
 pub mod error;
 
-// Batch 2 — Identity state & storage
-// pub mod storage;
-// pub mod identity;
+pub mod identity;
+pub mod storage;
 
 // Batch 3 — Control client
 // pub mod client;

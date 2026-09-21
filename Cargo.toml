@@ -16,7 +16,7 @@ dev = ["fleetos-core/dev"]
 
 [dependencies]
 # --- FleetOS crates ---
-fleetos-core = { path = "../fleetos-core", features = ["tpm", "ca", "vsock-attest"] }
+fleetos-core = { path = "../fleetos-core", features = ["production"] }
 fleetos-ebpf-common = { path = "../fleetos-ebpf/fleetos-ebpf-common" }
 fleetos-policy-compiler = { path = "../fleetos-policy-compiler" }
 
@@ -67,6 +67,9 @@ parking_lot = "0.12.5"
 
 # --- Time ---
 time = "0.3.55"
+
+[dev-dependencies]
+tempfile = "3.27.0"
 
 [lints.rust]
 # Allow the `fleetos_dev` cfg flag without compiler warnings.

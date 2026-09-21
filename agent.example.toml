@@ -1,0 +1,80 @@
+# =============================================================================
+# fleetos-agent configuration
+# =============================================================================
+
+[node]
+name = "agent-1"
+trust_domain = "fleet.example.internal"
+
+# ---------------------------------------------------------------------------
+# Control plane connection
+# ---------------------------------------------------------------------------
+[control]
+address = "10.0.1.1:9443"
+trust_bundle_path = "/etc/fleetos/dc-trust-bundle.pem"
+
+# ---------------------------------------------------------------------------
+# Join configuration
+# ---------------------------------------------------------------------------
+[join]
+# "secure" = TPM credential activation (CR-10). Production.
+# "insecure" = join-token only, structural quote checks. TESTING ONLY.
+mode = "secure"
+# For insecure mode only: single-use join token from AdminService.GenerateJoinToken.
+token = ""
+# Path to the trust bundle for the attestation TLS leg.
+# trust_bundle_path = "/etc/fleetos/dc-trust-bundle.pem"
+# PCR indices to quote during attestation.
+pcr_indices = [0, 7, 9]
+
+# ---------------------------------------------------------------------------
+# TPM backend
+# ---------------------------------------------------------------------------
+[tpm]
+# "device" = hardware TPM via kernel resource manager (default).
+# "swtpm" = software TPM over TCP (dev/test fallback).
+# "mssim" = Microsoft TPM simulator over TCP.
+backend = "device"
+device_path = "/dev/tpmrm0"
+host = "localhost"
+port = 2321
+
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
+[storage]
+# Local disk only. Fjall uses a directory, not a single file.
+# Never a network filesystem.
+fjall_path = "/var/lib/fleetos/agent_db"
+
+# ---------------------------------------------------------------------------
+# eBPF configuration
+# ---------------------------------------------------------------------------
+[ebpf]
+# Path to the compiled eBPF object (AA-8).
+object_path = "/usr/lib/fleetos/fleetos-ebpf"
+# Cgroup v2 mount point for cgroup_sock_addr and sock_ops attachment.
+cgroup_path = "/sys/fs/cgroup"
+# BPF filesystem pin path for map pinning.
+pin_path = "/sys/fs/bpf/fleetos"
+# Percentage of headroom to add when sizing maps at load time (Ruling C).
+map_headroom_percent = 20
+# Network interfaces to attach TC programs to (for Cloud Hypervisor TAP devices).
+# interfaces = ["eth0", "tap0"]
+
+# ---------------------------------------------------------------------------
+# SVID lifecycle
+# ---------------------------------------------------------------------------
+[svid]
+ttl_secs = 3600           # 1 hour
+refresh_fraction = 0.75   # refresh at 75% elapsed
+
+# ---------------------------------------------------------------------------
+# VSOCK attestation server (for MicroVM guest attestation, CR-CORE-6)
+# ---------------------------------------------------------------------------
+[vsock_attest]
+port = 18001  # 0x4649
+# Paths to boot artifacts for host-measured attestation (EBPF-CR-3 / Q4b).
+# kernel_path = "/var/lib/fleetos/vmlinux"
+# rootfs_path = "/var/lib/fleetos/rootfs.erofs"
+# guest_init_path = "/usr/lib/fleetos/fleetos-guest-init"
