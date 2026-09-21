@@ -391,3 +391,4 @@ readiness. Needs an architect ruling.
 | Update `fleetos-agent-ledger.md` to mark Ruling A as RESOLVED. | Complete |
 | Batch 2: Identity State and Storage | Complete |
 | Batch 3: Control client (the redirect-and-retry foundation) | Complete |
+| Batch 4: BPF loader lifecycle + counters reader | Complete |

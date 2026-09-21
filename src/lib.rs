@@ -22,8 +22,7 @@ pub mod storage;
 
 pub mod client;
 
-// Batch 4 — eBPF loader lifecycle
-// pub mod ebpf;
+pub mod ebpf;
 
 // Batch 5 — Policy boundary
 // pub mod policy;
