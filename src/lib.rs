@@ -28,8 +28,7 @@ pub mod policy;
 
 pub mod routes;
 
-// Batch 7 — VSOCK attestation server
-// pub mod vsock_attest;
+pub mod vsock_attest;
 
 // Batch 8 — Secrets & degraded mode
 // pub mod secret;
