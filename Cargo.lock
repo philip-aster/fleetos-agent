@@ -990,6 +990,7 @@ dependencies = [
  "postcard",
  "prost",
  "rand 0.10.3",
+ "rcgen",
  "rustls",
  "rustls-pemfile",
  "serde",

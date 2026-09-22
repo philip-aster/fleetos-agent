@@ -48,6 +48,7 @@ base64 = "0.23.1"
 blake3 = "1.8.7"
 hex = "0.4.3"
 rand = "0.10.3"
+rcgen = "0.14.10"
 zeroize = { version = "1.9.0", features = ["derive"] }
 
 # --- TLS ---

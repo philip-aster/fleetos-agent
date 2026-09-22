@@ -32,8 +32,7 @@ pub mod vsock_attest;
 
 pub mod secret;
 
-// Batch 9 — Join flows
-// pub mod join;
+pub mod join;
 
 // Batch 10 — Workload lifecycle
 // pub mod workloads;
