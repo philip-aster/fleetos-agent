@@ -30,8 +30,7 @@ pub mod routes;
 
 pub mod vsock_attest;
 
-// Batch 8 — Secrets & degraded mode
-// pub mod secret;
+pub mod secret;
 
 // Batch 9 — Join flows
 // pub mod join;

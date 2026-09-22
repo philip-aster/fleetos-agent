@@ -391,7 +391,7 @@ readiness. Needs an architect ruling.
 | Batch 5: Policy Boundary | Complete |
 | Batch 6: Routes and Name Resolution | Complete |
 | Batch 7: VSOCK attestation server | Complete |
-| Batch 8: Secrets & degraded mode | Not Started |
+| Batch 8: Secrets & degraded mode | Complete |
 | Batch 9: Join Flows | Not Started |
 | Batch 10: Workload lifecycle stubs + boot-race guard | Not Started |
 | Batch 11: Status reporting & observability | Not Started |
