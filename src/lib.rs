@@ -26,8 +26,7 @@ pub mod ebpf;
 
 pub mod policy;
 
-// Batch 6 — Routes & name resolution
-// pub mod routes;
+pub mod routes;
 
 // Batch 7 — VSOCK attestation server
 // pub mod vsock_attest;
