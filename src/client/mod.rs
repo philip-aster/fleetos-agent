@@ -10,7 +10,16 @@ pub mod retry;
 pub mod unary;
 pub mod watch;
 
+use crate::client::channels::build_mtls_channel;
+use crate::error::AgentError;
+use crate::identity::keystore::TpmSealedStore;
 use crate::identity::svid::SvidState;
+use crate::storage::Storage;
+use fleetos_core::proto::fleetos::{
+    pod_event_service_client::PodEventServiceClient,
+    workload_status_service_client::WorkloadStatusServiceClient,
+};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
 
@@ -25,15 +34,76 @@ pub struct ControlPlaneClient {
     channel: RwLock<Option<Channel>>,
     /// The last known SVID generation, used to detect rotations.
     last_svid_generation: RwLock<u64>,
+
+    /// Dependencies required to rebuild the mTLS channel.
+    storage: Arc<Storage>,
+    keystore: Arc<TpmSealedStore>,
+    trust_bundle_pem: Arc<String>,
+    svid_state: Arc<RwLock<SvidState>>,
 }
 
 impl ControlPlaneClient {
-    pub fn new(initial_target: String) -> Self {
+    pub fn new(
+        initial_target: String,
+        storage: Arc<Storage>,
+        keystore: Arc<TpmSealedStore>,
+        trust_bundle_pem: Arc<String>,
+        svid_state: Arc<RwLock<SvidState>>,
+    ) -> Self {
         Self {
             current_target: RwLock::new(initial_target),
             channel: RwLock::new(None),
             last_svid_generation: RwLock::new(0),
+            storage,
+            keystore,
+            trust_bundle_pem,
+            svid_state,
         }
+    }
+
+    /// Get a valid channel to the control plane.
+    /// Rebuilds if retargeted or if SVID rotated.
+    pub async fn get_channel(&self) -> Result<Channel, AgentError> {
+        let mut channel_guard = self.channel.write().await;
+
+        // Check SVID rotation
+        let svid_state_guard = self.svid_state.read().await;
+        let mut last_gen = self.last_svid_generation.write().await;
+        if svid_state_guard.generation > *last_gen {
+            tracing::info!(
+                old_gen = *last_gen,
+                new_gen = svid_state_guard.generation,
+                "SVID rotated, rebuilding mTLS channel"
+            );
+            *last_gen = svid_state_guard.generation;
+            *channel_guard = None;
+        }
+
+        if let Some(chan) = channel_guard.clone() {
+            return Ok(chan);
+        }
+
+        let target = self.current_target.read().await.clone();
+        let cert_chain_der = svid_state_guard.cert_chain_der.clone();
+        drop(svid_state_guard); // Release lock before blocking on TPM or async build
+
+        let private_key_der = self
+            .keystore
+            .load_sealing_secret(&self.storage)?
+            .ok_or_else(|| {
+                AgentError::Identity("sealing private key not found in keystore".into())
+            })?;
+
+        let new_channel = build_mtls_channel(
+            &target,
+            &self.trust_bundle_pem,
+            &cert_chain_der,
+            &private_key_der,
+        )
+        .await?;
+
+        *channel_guard = Some(new_channel.clone());
+        Ok(new_channel)
     }
 
     /// Update the target address (e.g., after a leader redirect).
@@ -42,24 +112,20 @@ impl ControlPlaneClient {
         if *target != new_target {
             tracing::info!(old = %*target, new = %new_target, "retargeting control plane client");
             *target = new_target;
-            // Invalidate the channel so it's rebuilt on next use
             let mut chan = self.channel.write().await;
             *chan = None;
         }
     }
 
-    /// Check if the SVID has rotated and invalidate the channel if so.
-    pub async fn check_svid_rotation(&self, current_state: &SvidState) {
-        let mut last_gen = self.last_svid_generation.write().await;
-        if current_state.generation > *last_gen {
-            tracing::info!(
-                old_gen = *last_gen,
-                new_gen = current_state.generation,
-                "SVID rotated, rebuilding mTLS channel"
-            );
-            *last_gen = current_state.generation;
-            let mut chan = self.channel.write().await;
-            *chan = None;
-        }
+    /// Create a typed client for WorkloadStatus reporting.
+    pub async fn workload_status_client(
+        &self,
+    ) -> Result<WorkloadStatusServiceClient<Channel>, AgentError> {
+        Ok(WorkloadStatusServiceClient::new(self.get_channel().await?))
+    }
+
+    /// Create a typed client for PodEvent reporting.
+    pub async fn pod_event_client(&self) -> Result<PodEventServiceClient<Channel>, AgentError> {
+        Ok(PodEventServiceClient::new(self.get_channel().await?))
     }
 }

@@ -14,7 +14,6 @@ use tokio::sync::{RwLock, watch};
 use tracing_subscriber::EnvFilter;
 
 use fleetos_agent::client::ControlPlaneClient;
-use fleetos_agent::client::channels::build_mtls_channel;
 use fleetos_agent::config::AgentConfig;
 use fleetos_agent::ebpf::EbpfManager;
 use fleetos_agent::identity::keystore::TpmSealedStore;
@@ -88,12 +87,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // --- Phase 2: Storage ---
-    let storage = Storage::open(&config.storage.fjall_path)?;
+    let storage = Arc::new(Storage::open(&config.storage.fjall_path)?);
     tracing::info!(path = %config.storage.fjall_path.display(), "storage opened");
 
     // --- Phase 3: Keystore (TPM-sealed) ---
     let tpm_endpoint = config.tpm_endpoint();
-    let keystore = TpmSealedStore::new(tpm_endpoint);
+    let keystore = Arc::new(TpmSealedStore::new(tpm_endpoint));
     tracing::info!("keystore initialized");
 
     // --- Phase 4: SVID load or join ---
@@ -119,29 +118,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "SVID loaded from storage"
         );
     }
+    let svid_state_lock = Arc::new(RwLock::new(svid_state));
 
     // --- Phase 5: Control plane client (mTLS) ---
-    let trust_bundle_pem =
+    let trust_bundle_pem = Arc::new(
         std::fs::read_to_string(&config.control.trust_bundle_path).map_err(|e| {
             fleetos_agent::error::AgentError::Config(format!("failed to read trust bundle: {}", e))
-        })?;
+        })?,
+    );
 
-    let private_key_der = keystore.load_sealing_secret(&storage)?.ok_or_else(|| {
-        fleetos_agent::error::AgentError::Identity(
-            "sealing private key not found in keystore".into(),
-        )
-    })?;
+    let control_client = Arc::new(ControlPlaneClient::new(
+        config.control.address.clone(),
+        storage.clone(),
+        keystore.clone(),
+        trust_bundle_pem,
+        svid_state_lock.clone(),
+    ));
 
-    let channel = build_mtls_channel(
-        &config.control.address,
-        &trust_bundle_pem,
-        &svid_state.cert_chain_der,
-        &private_key_der,
-    )
-    .await?;
+    // Verify channel can be established
+    let _channel = control_client.get_channel().await?;
     tracing::info!("mTLS channel established to control plane");
-
-    let _control_client = Arc::new(ControlPlaneClient::new(config.control.address.clone()));
 
     // --- Phase 6: eBPF ---
     let mut ebpf_manager = EbpfManager::load(&config.ebpf)?;
@@ -187,10 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("VSOCK attestation server started");
 
     // --- Phase 9: Status reporter ---
-    let status_client =
-        fleetos_core::proto::fleetos::workload_status_service_client::WorkloadStatusServiceClient::new(
-            channel.clone(),
-        );
+    let status_client = control_client.workload_status_client().await?;
     let status_reporter =
         StatusReporter::new(pod_manager.clone(), status_client, Duration::from_secs(15));
     let status_shutdown_rx = shutdown_rx.clone();
@@ -212,10 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("flow events drain started");
 
     // Pod events reporter.
-    let pod_event_client =
-        fleetos_core::proto::fleetos::pod_event_service_client::PodEventServiceClient::new(
-            channel.clone(),
-        );
+    let pod_event_client = control_client.pod_event_client().await?;
     let pod_event_reporter = PodEventReporter::new(
         config.node.name.clone(),
         pod_event_client,
@@ -234,10 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("pod event reporter started");
 
     // --- Phase 11: Counters reporter ---
-    let counters_client =
-        fleetos_core::proto::fleetos::workload_status_service_client::WorkloadStatusServiceClient::new(
-            channel.clone(),
-        );
+    let counters_client = control_client.workload_status_client().await?;
     let counters_reporter = fleetos_agent::ebpf::counters::CountersReporter::new(
         pod_net_counters_map,
         counters_client,

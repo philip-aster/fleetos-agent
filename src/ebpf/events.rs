@@ -12,6 +12,8 @@
 use crate::error::AgentError;
 use aya::Ebpf;
 use aya::maps::RingBuf;
+use fleetos_ebpf_common::FlowEvent;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Take the FLOW_EVENTS ring buffer from the eBPF object.
 pub fn take_flow_events_ringbuf(
@@ -31,21 +33,51 @@ pub struct ParsedFlowEvent {
     pub port: u16,
     pub action: u8,    // 0 = deny, 1 = allow
     pub direction: u8, // 0 = ingress, 1 = egress
+    pub timestamp_unix: u64,
+}
+
+impl From<&FlowEvent> for ParsedFlowEvent {
+    fn from(event: &FlowEvent) -> Self {
+        Self {
+            src_fingerprint: event.src_hash.0,
+            dst_fingerprint: event.dst_hash.0,
+            port: event.port.0,
+            action: event.action,
+            direction: event.direction,
+            timestamp_unix: now_unix(),
+        }
+    }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Drain all pending events from the ring buffer.
 ///
 /// Returns a vector of parsed events. Non-blocking: returns immediately
 /// with whatever is available.
-///
-/// TODO(Batch 11): Wire the actual Aya 0.14 RingBuf drain loop.
-/// Aya 0.14's RingBuf requires epoll/poll integration for async draining
-/// rather than a simple synchronous callback. For Batch 4, we provide
-/// the structural boundary and parsing logic only. The actual drain loop
-/// will be implemented when we wire the observability subsystem.
 pub fn drain_events(
-    _ring_buf: &mut RingBuf<aya::maps::MapData>,
+    ring_buf: &mut RingBuf<aya::maps::MapData>,
 ) -> Result<Vec<ParsedFlowEvent>, AgentError> {
-    // Stub: return empty vector. Actual drain logic lands in Batch 11.
-    Ok(Vec::new())
+    let mut events = Vec::new();
+
+    while let Some(item) = ring_buf.next() {
+        let bytes: &[u8] = &item;
+        if bytes.len() < std::mem::size_of::<FlowEvent>() {
+            tracing::warn!(
+                len = bytes.len(),
+                expected = std::mem::size_of::<FlowEvent>(),
+                "FLOW_EVENTS: truncated event, skipping"
+            );
+            continue;
+        }
+        let event: &FlowEvent = bytemuck::from_bytes(&bytes[..std::mem::size_of::<FlowEvent>()]);
+        events.push(ParsedFlowEvent::from(event));
+    }
+
+    Ok(events)
 }

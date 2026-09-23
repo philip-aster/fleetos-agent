@@ -4,7 +4,6 @@
 //! `PendingUpstream` is the fail-closed stub: anything blocked on an upstream
 //! dependency returns this variant. Callers must treat it as "feature
 //! unavailable", never as "empty policy = allow". Default-deny stays intact.
-
 use thiserror::Error;
 
 /// Top-level error type for the fleetos-agent daemon.
@@ -29,6 +28,12 @@ pub enum AgentError {
 
     #[error("gRPC transport error: {0}")]
     GrpcTransport(#[from] tonic::transport::Error),
+
+    /// An RPC failed at the application level: redirect-and-retry was
+    /// exhausted or the error was classified as fatal. Distinct from
+    /// `GrpcTransport`, which carries the underlying channel error.
+    #[error("RPC failed: {0}")]
+    Rpc(String),
 
     #[error("attestation error: {0}")]
     Attestation(String),
