@@ -80,6 +80,7 @@ fleetos-agent/
 │   │
 │   └── observability/
 │       ├── flow_events.rs            # Batch 11 — FlowEvent → OTLP push structure (no inbound scrape, ever)
+        ├── mod.rs 
 │       └── pod_events.rs             # Batch 11 — Pod lifecycle events → PodEventService.ReportPodEvents (CR-CORE-8)
 │
 └── tests/
@@ -394,5 +395,5 @@ readiness. Needs an architect ruling.
 | Batch 8: Secrets & degraded mode | Complete |
 | Batch 9: Join Flows | Complete |
 | Batch 10: Workload lifecycle stubs + boot-race guard | Complete |
-| Batch 11: Status reporting & observability | Not Started |
-| Batch 12: Full wiring & shutdown | Not Started |
+| Batch 11: Status reporting & observability | Complete |
+| Batch 12: Full wiring & shutdown | In Progress |

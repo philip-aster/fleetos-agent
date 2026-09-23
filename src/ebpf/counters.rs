@@ -22,7 +22,12 @@
 use crate::error::AgentError;
 use aya::maps::PerCpuHashMap;
 use bytemuck;
+use fleetos_core::proto::fleetos::workload_status_service_client::WorkloadStatusServiceClient;
+use fleetos_core::proto::state::PodMetrics;
 use fleetos_ebpf_common::PodNetCounters;
+use std::time::Duration;
+use tokio::sync::watch;
+use tonic::transport::Channel;
 
 /// Aggregated counters across all CPUs for a single workload IP.
 ///
@@ -138,5 +143,121 @@ impl PodNetCountersReader {
         self.previous = current_aggregates;
 
         Ok(rates)
+    }
+}
+
+/// Counters reporting loop. Periodically reads POD_NET_COUNTERS,
+/// aggregates and computes rates, and sends PodMetrics via ReportPodMetrics.
+///
+/// Merges TAP-path counters with containerd proxy accounting before reporting.
+/// The TAP-path counters come from the eBPF POD_NET_COUNTERS map.
+/// The containerd proxy accounting is tracked separately by the agent.
+pub struct CountersReporter {
+    reader: PodNetCountersReader,
+    map: aya::maps::PerCpuHashMap<aya::maps::MapData, u32, [u64; 4]>,
+    client: WorkloadStatusServiceClient<Channel>,
+    interval: Duration,
+    /// Containerd proxy accounting: pod_id -> (tx_bytes, rx_bytes).
+    /// Tracked separately from the eBPF counters.
+    containerd_accounting: std::collections::HashMap<String, (u64, u64)>,
+}
+
+impl CountersReporter {
+    pub fn new(
+        map: aya::maps::PerCpuHashMap<aya::maps::MapData, u32, [u64; 4]>,
+        client: WorkloadStatusServiceClient<Channel>,
+        interval: Duration,
+    ) -> Self {
+        Self {
+            reader: PodNetCountersReader::new(),
+            map,
+            client,
+            interval,
+            containerd_accounting: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record containerd proxy accounting for a pod.
+    /// Called by the containerd proxy adapter when it observes traffic.
+    pub fn record_containerd_traffic(&mut self, pod_id: &str, tx_bytes: u64, rx_bytes: u64) {
+        let entry = self
+            .containerd_accounting
+            .entry(pod_id.to_string())
+            .or_insert((0, 0));
+        entry.0 += tx_bytes;
+        entry.1 += rx_bytes;
+    }
+
+    /// Run the counters reporting loop. Periodically reads rates and sends PodMetrics.
+    pub async fn run_reporter_loop(
+        mut self,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<(), crate::error::AgentError> {
+        let mut interval = tokio::time::interval(self.interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let interval_secs = self.interval.as_secs();
+
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        tracing::info!("counters reporter shutting down");
+                        return Ok(());
+                    }
+                }
+                _ = interval.tick() => {
+                    self.report_counters(interval_secs).await?;
+                }
+            }
+        }
+    }
+
+    /// Read counters, compute rates, and send PodMetrics.
+    async fn report_counters(
+        &mut self,
+        interval_secs: u64,
+    ) -> Result<(), crate::error::AgentError> {
+        let rates = self
+            .reader
+            .read_and_compute_rates(&mut self.map, interval_secs)?;
+
+        let window_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        for (ip_key, rate) in rates {
+            // TODO: Map ip_key to pod_id. For now, use the IP as the pod_id.
+            // In production, this would look up the pod_id from the IP.
+            let pod_id = format!("{}", ip_key);
+
+            // Merge TAP-path counters with containerd proxy accounting.
+            let (containerd_tx, containerd_rx) = self
+                .containerd_accounting
+                .get(&pod_id)
+                .copied()
+                .unwrap_or((0, 0));
+
+            let metrics = PodMetrics {
+                pod_id,
+                cpu_millicores: 0, // TODO: Wire CPU metrics from cgroup.
+                memory_bytes: 0,   // TODO: Wire memory metrics from cgroup.
+                net_tx_bytes: rate.tx_bytes_per_sec + containerd_tx,
+                net_rx_bytes: rate.rx_bytes_per_sec + containerd_rx,
+                window_unix,
+            };
+
+            match self.client.report_pod_metrics(metrics).await {
+                Ok(_ack) => {
+                    tracing::debug!("pod metrics sent");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to send pod metrics");
+                }
+            }
+        }
+
+        Ok(())
     }
 }

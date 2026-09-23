@@ -62,6 +62,10 @@ pub struct Pod {
     pub vsock_cid: Option<u32>,
     /// Identity fingerprint for this pod's workload.
     pub fingerprint: IdentityFingerprint,
+    /// Readiness probe passing (separate from Ruling D gate).
+    pub probe_ready: bool,
+    /// Liveness probe passing.
+    pub probe_live: bool,
 }
 
 impl Pod {
@@ -90,6 +94,8 @@ impl Pod {
             pid: None,
             vsock_cid: None,
             fingerprint,
+            probe_ready: false,
+            probe_live: false,
         }
     }
 
