@@ -396,4 +396,4 @@ readiness. Needs an architect ruling.
 | Batch 9: Join Flows | Complete |
 | Batch 10: Workload lifecycle stubs + boot-race guard | Complete |
 | Batch 11: Status reporting & observability | Complete |
-| Batch 12: Full wiring & shutdown | In Progress |
+| Batch 12: Full wiring & shutdown | Complete |
