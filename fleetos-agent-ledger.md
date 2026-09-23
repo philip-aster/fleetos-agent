@@ -393,6 +393,6 @@ readiness. Needs an architect ruling.
 | Batch 7: VSOCK attestation server | Complete |
 | Batch 8: Secrets & degraded mode | Complete |
 | Batch 9: Join Flows | Complete |
-| Batch 10: Workload lifecycle stubs + boot-race guard | Not Started |
+| Batch 10: Workload lifecycle stubs + boot-race guard | Complete |
 | Batch 11: Status reporting & observability | Not Started |
 | Batch 12: Full wiring & shutdown | Not Started |

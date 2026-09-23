@@ -34,8 +34,6 @@ pub mod secret;
 
 pub mod join;
 
-// Batch 10 — Workload lifecycle
-// pub mod workloads;
+pub mod workloads;
 
-// Batch 11 — Observability
-// pub mod observability;
+pub mod observability;
