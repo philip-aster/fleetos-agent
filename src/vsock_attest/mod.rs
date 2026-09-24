@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::Arc;
 
+use fleetos_core::proto::fleetos::PodSpec;
 use parking_lot::RwLock;
 use tokio::sync::watch;
 
@@ -29,6 +30,19 @@ use crate::error::AgentError;
 
 use self::measure::BootMeasurement;
 use self::verify::VsockQuoteVerifier;
+
+/// Context for a launched workload VM, indexed by VSOCK CID.
+/// Populated by the workload launcher before the VM boots.
+/// Used by the VSOCK attestation server to build the WorkloadConfig.
+#[derive(Debug, Clone)]
+pub struct WorkloadContext {
+    /// The pod spec for this workload.
+    pub pod_spec: PodSpec,
+    /// Guest network configuration.
+    pub guest_ip: [u8; 4],
+    pub netmask: [u8; 4],
+    pub gateway: [u8; 4],
+}
 
 /// The VSOCK attestation server. One instance per hosting agent.
 ///
@@ -42,6 +56,9 @@ pub struct VsockAttestServer {
     /// Boot measurements indexed by guest CID. Populated when the agent
     /// launches a MicroVM (Batch 10). Used by host-measured verification.
     boot_measurements: Arc<RwLock<HashMap<u32, BootMeasurement>>>,
+    /// Workload contexts indexed by guest CID. Populated when the agent
+    /// launches a MicroVM. Used by config_push to build WorkloadConfig.
+    workload_contexts: Arc<RwLock<HashMap<u32, WorkloadContext>>>,
     /// Config push builder.
     config_builder: Arc<config_push::WorkloadConfigBuilder>,
 }
@@ -54,15 +71,12 @@ impl VsockAttestServer {
         Self {
             verifier,
             boot_measurements: Arc::new(RwLock::new(HashMap::new())),
+            workload_contexts: Arc::new(RwLock::new(HashMap::new())),
             config_builder,
         }
     }
 
     /// Register a boot measurement for a guest CID.
-    ///
-    /// Called by the workload launcher (Batch 10) before bringing up the
-    /// MicroVM's network. The measurement is used by host-measured
-    /// verification to confirm the guest is running expected boot artifacts.
     pub fn register_boot_measurement(&self, cid: u32, measurement: BootMeasurement) {
         self.boot_measurements.write().insert(cid, measurement);
     }
@@ -72,10 +86,18 @@ impl VsockAttestServer {
         self.boot_measurements.write().remove(&cid);
     }
 
+    /// Register a workload context for a guest CID.
+    /// Called by the workload launcher before bringing up the MicroVM.
+    pub fn register_workload_context(&self, cid: u32, context: WorkloadContext) {
+        self.workload_contexts.write().insert(cid, context);
+    }
+
+    /// Remove the workload context for a guest CID (on VM teardown).
+    pub fn unregister_workload_context(&self, cid: u32) {
+        self.workload_contexts.write().remove(&cid);
+    }
+
     /// Run the accept loop. Blocks until the shutdown signal fires.
-    ///
-    /// Each incoming connection is handled in a dedicated blocking task
-    /// (VSOCK I/O is synchronous, matching the guest-init pattern).
     pub async fn run(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), AgentError> {
         let listener = vsock_listen()?;
         let listener_raw = listener.as_raw_fd();
@@ -87,6 +109,7 @@ impl VsockAttestServer {
 
         let verifier = self.verifier.clone();
         let measurements = self.boot_measurements.clone();
+        let workload_contexts = self.workload_contexts.clone();
         let config_builder = self.config_builder.clone();
 
         loop {
@@ -105,9 +128,10 @@ impl VsockAttestServer {
                             tracing::info!(peer_cid, "VSOCK connection accepted");
                             let v = verifier.clone();
                             let m = measurements.clone();
+                            let wc = workload_contexts.clone();
                             let cb = config_builder.clone();
                             tokio::task::spawn_blocking(move || {
-                                if let Err(e) = handle_connection(stream, peer_cid, &v, &m, &cb) {
+                                if let Err(e) = handle_connection(stream, peer_cid, &v, &m, &wc, &cb) {
                                     tracing::warn!(peer_cid, error = %e, "VSOCK handshake failed");
                                 }
                             });
@@ -133,6 +157,7 @@ fn handle_connection(
     peer_cid: u32,
     verifier: &VsockQuoteVerifier,
     measurements: &RwLock<HashMap<u32, BootMeasurement>>,
+    workload_contexts: &RwLock<HashMap<u32, WorkloadContext>>,
     config_builder: &config_push::WorkloadConfigBuilder,
 ) -> Result<(), AgentError> {
     use fleetos_core::vsock_proto::*;
@@ -175,7 +200,16 @@ fn handle_connection(
     if result.accepted {
         // Step 4: Push WorkloadConfig using the verified guest identity.
         let verified = verification.unwrap();
-        let config = config_builder.build(&verified)?;
+        let workload_ctx = workload_contexts.read().get(&peer_cid).cloned();
+
+        let config = match workload_ctx {
+            Some(ctx) => config_builder.build(&verified, &ctx)?,
+            None => {
+                tracing::warn!(peer_cid, "no workload context found, using empty config");
+                config_builder.build_fallback(&verified)?
+            }
+        };
+
         write_msg(fd, &config)?;
         tracing::info!(peer_cid, "workload config pushed");
     }
