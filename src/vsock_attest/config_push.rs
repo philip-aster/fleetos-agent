@@ -28,24 +28,21 @@ use super::verify::VerifiedGuest;
 /// generation is a TODO pending Batch 8 (delegated signing) and Batch 9
 /// (join flow).
 pub struct WorkloadConfigBuilder {
-    /// The trust domain for this cluster.
     trust_domain: String,
-    /// Dummy-IP routes to include in the config.
-    /// Populated from routes/table.rs (Batch 6).
-    dummy_ip_routes: Vec<DummyIpRouteConfig>,
+    dummy_ip_routes: std::sync::RwLock<Vec<DummyIpRouteConfig>>,
 }
 
 impl WorkloadConfigBuilder {
     pub fn new(trust_domain: String) -> Self {
         Self {
             trust_domain,
-            dummy_ip_routes: Vec::new(),
+            dummy_ip_routes: std::sync::RwLock::new(Vec::new()),
         }
     }
 
-    /// Set the dummy-IP routes to include in workload configs.
-    pub fn set_dummy_ip_routes(&mut self, routes: Vec<DummyIpRouteConfig>) {
-        self.dummy_ip_routes = routes;
+    /// Set the dummy-IP routes (driven by WatchRoutes). Takes &self for Arc use.
+    pub fn set_dummy_ip_routes(&self, routes: Vec<DummyIpRouteConfig>) {
+        *self.dummy_ip_routes.write().unwrap() = routes;
     }
 
     /// Build a `WorkloadConfig` for a verified guest using the workload context.
@@ -95,7 +92,7 @@ impl WorkloadConfigBuilder {
             svid_private_key_der,
             env_vars,
             volume_mounts,
-            dummy_ip_routes: self.dummy_ip_routes.clone(),
+            dummy_ip_routes: self.dummy_ip_routes.read().unwrap().clone(),
             workload_binary_path,
             workload_args,
             trust_domain: self.trust_domain.clone(),
@@ -118,7 +115,7 @@ impl WorkloadConfigBuilder {
             svid_private_key_der,
             env_vars: Vec::new(),
             volume_mounts: Vec::new(),
-            dummy_ip_routes: self.dummy_ip_routes.clone(),
+            dummy_ip_routes: self.dummy_ip_routes.read().unwrap().clone(),
             workload_binary_path: String::new(),
             workload_args: Vec::new(),
             trust_domain: self.trust_domain.clone(),
@@ -139,7 +136,7 @@ mod tests {
 
     #[test]
     fn config_push_populates_fields_from_context() {
-        let mut builder = WorkloadConfigBuilder::new("fleet.example.internal".to_string());
+        let builder = WorkloadConfigBuilder::new("fleet.example.internal".to_string());
         builder.set_dummy_ip_routes(vec![DummyIpRouteConfig {
             dummy_ip: [240, 0, 0, 45],
             service: "db".to_string(),

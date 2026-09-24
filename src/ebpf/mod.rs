@@ -9,6 +9,7 @@ pub mod counters;
 pub mod events;
 pub mod loader;
 pub mod maps;
+pub mod net_guard_adapter;
 pub mod programs;
 
 use crate::config::EbpfConfig;

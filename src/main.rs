@@ -166,14 +166,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fleetos_agent::ebpf::maps::pod_net_counters_map(&mut ebpf_manager.ebpf)?;
     tracing::info!("POD_NET_COUNTERS map acquired");
 
+    // Wrap for shared access (NetGuard needs &mut Ebpf for TC attach at VM boot).
+    let ebpf_manager = std::sync::Arc::new(std::sync::Mutex::new(ebpf_manager));
+    let net_guard = std::sync::Arc::new(
+        fleetos_agent::ebpf::net_guard_adapter::VmNetGuardAdapter::new(ebpf_manager.clone())?,
+    );
+
     // --- Phase 7: Shared state ---
     let pod_manager = Arc::new(RwLock::new(PodManager::new()));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    // --- Runtime adapters + orchestration ---
+    let containerd_adapter = std::sync::Arc::new(
+        fleetos_agent::workloads::containerd::ContainerdAdapter::new_lazy("fleetos", String::new()),
+    );
+    let volume_config = fleetos_agent::workloads::volumes::VolumeConfig::default();
+    let workload_manager = std::sync::Arc::new(fleetos_agent::workloads::WorkloadManager::new(
+        containerd_adapter.clone(),
+        volume_config,
+        pod_manager.clone(),
+        Some(net_guard.clone()),
+        config.node.trust_domain.clone(),
+    ));
+
+    let secrets_handler = std::sync::Arc::new(fleetos_agent::wiring::SecretsHandler::new(
+        control_client.clone(),
+        storage.clone(),
+        keystore.clone(),
+        svid_state_lock.clone(),
+    ));
+
     // --- Phase 8: VSOCK attestation server ---
     let verifier = Arc::new(VsockQuoteVerifier::new());
     let config_builder = Arc::new(WorkloadConfigBuilder::new(config.node.trust_domain.clone()));
-    let vsock_server = VsockAttestServer::new(verifier, config_builder);
+    let vsock_server = VsockAttestServer::new(verifier, config_builder.clone());
     let vsock_shutdown_rx = shutdown_rx.clone();
     let vsock_handle = tokio::spawn(async move {
         if let Err(e) = vsock_server.run(vsock_shutdown_rx).await {
@@ -242,11 +268,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("counters reporter started");
 
     // --- Phase 12: Watch loops (SAG, Schedule, Events, Routes) ---
-    // These are wired in later batches when the full watch infrastructure is ready.
-    // For now, we log that they would be started here.
-    tracing::info!("watch loops: SAG, Schedule, Events, Routes (wired in later batches)");
-
-    tracing::info!("fleetos-agent fully initialized and running");
+    let sag_handle = tokio::spawn(fleetos_agent::wiring::run_sag_watch(
+        control_client.clone(),
+        ebpf_manager.clone(),
+    ));
+    let schedule_handle = tokio::spawn(fleetos_agent::wiring::run_schedule_watch(
+        control_client.clone(),
+        workload_manager.clone(),
+    ));
+    let events_handle = tokio::spawn(fleetos_agent::wiring::run_events_watch(
+        control_client.clone(),
+        secrets_handler.clone(),
+    ));
+    let routes_handle = tokio::spawn(fleetos_agent::wiring::run_routes_watch(
+        control_client.clone(),
+        config_builder.clone(),
+        containerd_adapter.clone(),
+        config.node.trust_domain.clone(),
+    ));
+    tracing::info!("watch loops started: SAG, Schedule, Events, Routes");
 
     // --- Phase 13: Wait for shutdown signal ---
     tokio::signal::ctrl_c().await?;
@@ -265,10 +305,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         flow_handle,
         pod_event_handle,
         counters_handle,
+        sag_handle,
+        schedule_handle,
+        events_handle,
+        routes_handle,
     );
 
     // Detach eBPF programs.
-    ebpf_manager.shutdown();
+    ebpf_manager
+        .lock()
+        .expect("ebpf_manager mutex poisoned during shutdown")
+        .shutdown();
     tracing::info!("eBPF programs detached");
 
     // Flush storage.

@@ -20,6 +20,8 @@ pub mod error;
 pub mod identity;
 pub mod storage;
 
+pub mod wiring;
+
 pub mod client;
 
 pub mod ebpf;

@@ -20,33 +20,42 @@ pub const CONTAINERD_SOCKET: &str = "unix:///run/containerd/containerd.sock";
 
 /// The adapter holds a gRPC channel to containerd.
 pub struct ContainerdAdapter {
-    /// containerd namespace (isolates fleetos containers).
     namespace: String,
-    /// Hosts-file content injected into each container (Q3: agent renders it).
-    hosts_content: String,
-    /// gRPC channel to the containerd socket.
-    channel: tonic::transport::Channel,
+    hosts_content: std::sync::RwLock<String>,
+    channel: tokio::sync::Mutex<Option<tonic::transport::Channel>>,
 }
 
 impl ContainerdAdapter {
-    /// Connect to containerd over its Unix socket.
-    pub async fn connect(namespace: &str, hosts_content: String) -> Result<Self, AgentError> {
-        // SDK VERIFICATION POINT: tonic Endpoint over unix:// scheme.
-        let channel = tonic::transport::Endpoint::try_from(CONTAINERD_SOCKET)
-            .map_err(|e| AgentError::Workload(format!("containerd endpoint: {e}")))?
-            .connect()
-            .await
-            .map_err(|e| AgentError::Workload(format!("containerd connect: {e}")))?;
-
-        Ok(Self {
+    /// Create without connecting. Connection happens lazily on first use.
+    pub fn new_lazy(namespace: &str, hosts_content: String) -> Self {
+        Self {
             namespace: namespace.to_string(),
-            hosts_content,
-            channel,
-        })
+            hosts_content: std::sync::RwLock::new(hosts_content),
+            channel: tokio::sync::Mutex::new(None),
+        }
     }
 
     pub fn namespace(&self) -> &str {
         &self.namespace
+    }
+
+    /// Update the agent-rendered /etc/hosts content (driven by WatchRoutes).
+    pub fn set_hosts_content(&self, content: String) {
+        *self.hosts_content.write().unwrap() = content;
+    }
+
+    /// Lazily establish (or reuse) the gRPC channel to containerd.
+    async fn channel(&self) -> Result<tonic::transport::Channel, AgentError> {
+        let mut guard = self.channel.lock().await;
+        if guard.is_none() {
+            let ch = tonic::transport::Endpoint::try_from(CONTAINERD_SOCKET)
+                .map_err(|e| AgentError::Workload(format!("containerd endpoint: {e}")))?
+                .connect()
+                .await
+                .map_err(|e| AgentError::Workload(format!("containerd connect: {e}")))?;
+            *guard = Some(ch);
+        }
+        Ok(guard.clone().unwrap())
     }
 
     /// Boot a container. Returns the task PID.
@@ -66,12 +75,16 @@ impl ContainerdAdapter {
             .unwrap_or_else(|| spec.workload_id.clone());
 
         // Q3: Agent renders /etc/hosts for the containerd path.
-        // Write the agent-managed hosts content to disk before bind-mounting.
         let hosts_path = format!("/run/fleetos/pods/{}/hosts", spec.workload_id);
         if let Some(parent) = std::path::Path::new(&hosts_path).parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&hosts_path, &self.hosts_content)?;
+        let hosts_content = self.hosts_content.read().unwrap().clone();
+        std::fs::write(&hosts_path, &hosts_content)?;
+
+        let channel = self.channel().await?;
+        let mut containers = ContainersClient::new(channel.clone());
+        let mut tasks = TasksClient::new(channel.clone());
 
         // 1. OCI spec (includes /etc/hosts bind-mount + cgroup limits).
         let oci_spec = self.build_oci_spec(spec, mounts)?;
@@ -83,9 +96,6 @@ impl ContainerdAdapter {
         use containerd_client::services::v1::{
             Container, CreateContainerRequest, CreateTaskRequest, StartRequest,
         };
-
-        let mut containers = ContainersClient::new(self.channel.clone());
-        let mut tasks = TasksClient::new(self.channel.clone());
 
         let container = Container {
             id: pod_id.clone(),
@@ -134,8 +144,9 @@ impl ContainerdAdapter {
             DeleteContainerRequest, DeleteTaskRequest, KillRequest,
         };
 
-        let mut tasks = TasksClient::new(self.channel.clone());
-        let mut containers = ContainersClient::new(self.channel.clone());
+        let channel = self.channel().await?;
+        let mut tasks = TasksClient::new(channel.clone());
+        let mut containers = ContainersClient::new(channel.clone());
 
         // SIGTERM (signal 15).
         let _ = tasks
