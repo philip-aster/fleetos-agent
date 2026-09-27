@@ -59,6 +59,11 @@ pub struct JoinConfig {
     /// For insecure mode only: single-use join token.
     #[serde(default)]
     pub token: String,
+    /// For insecure mode only: path to a file containing the join token.
+    /// If set, the token is read from this file at config load time.
+    /// Takes precedence over `token` if both are set.
+    #[serde(default)]
+    pub join_token_path: Option<PathBuf>,
     /// Path to the trust bundle for the attestation TLS leg.
     #[serde(default)]
     pub trust_bundle_path: Option<PathBuf>,
@@ -72,6 +77,7 @@ impl Default for JoinConfig {
         Self {
             mode: default_join_mode(),
             token: String::new(),
+            join_token_path: None,
             trust_bundle_path: None,
             pcr_indices: default_pcr_indices(),
         }
@@ -259,15 +265,30 @@ impl Default for VsockAttestConfig {
     }
 }
 
+// fleetos-agent/src/config.rs
+
 impl AgentConfig {
     /// Load configuration from a TOML file.
     pub fn load(path: &Path) -> Result<Self, crate::error::AgentError> {
         let raw = std::fs::read_to_string(path).map_err(|e| {
             crate::error::AgentError::Config(format!("failed to read config: {}", e))
         })?;
-        let config: AgentConfig = toml::from_str(&raw).map_err(|e| {
+        let mut config: AgentConfig = toml::from_str(&raw).map_err(|e| {
             crate::error::AgentError::Config(format!("failed to parse config: {}", e))
         })?;
+
+        // Resolve join_token_path if provided (takes precedence over inline token)
+        if let Some(ref token_path) = config.join.join_token_path {
+            let token = std::fs::read_to_string(token_path).map_err(|e| {
+                crate::error::AgentError::Config(format!(
+                    "failed to read join token file {}: {}",
+                    token_path.display(),
+                    e
+                ))
+            })?;
+            config.join.token = token.trim().to_owned();
+        }
+
         config.validate()?;
         Ok(config)
     }
@@ -331,6 +352,21 @@ impl AgentConfig {
                 host: self.tpm.host.clone(),
                 port: self.tpm.port,
             },
+        }
+    }
+
+    /// Returns the TPM endpoint for sensitive-key sealing, or `None` for
+    /// software-only sealing.
+    ///
+    /// Insecure join mode = testing deployment with no TPM → software sealing.
+    /// Secure join mode = production deployment → TPM sealing.
+    ///
+    /// All keystore construction (main.rs and the join flows) must use this so
+    /// the sealing method is consistent between store (join) and load (startup).
+    pub fn sealing_endpoint(&self) -> Option<fleetos_core::attestation::tpm::TpmEndpoint> {
+        match self.join.mode {
+            JoinMode::Insecure => None,
+            JoinMode::Secure => Some(self.tpm_endpoint()),
         }
     }
 }

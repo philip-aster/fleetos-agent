@@ -10,6 +10,18 @@
 use crate::error::AgentError;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
+/// Ensure the address has a scheme prefix.
+///
+/// `Endpoint::from_shared` requires a URL with a scheme (e.g. `https://`).
+/// If the address doesn't have one, prepend `https://`.
+fn ensure_scheme(address: &str) -> String {
+    if address.starts_with("http://") || address.starts_with("https://") {
+        address.to_string()
+    } else {
+        format!("https://{}", address)
+    }
+}
+
 /// Build a server-trust TLS channel (for the pre-SVID join leg).
 pub async fn build_server_trust_channel(
     address: &str,
@@ -18,15 +30,14 @@ pub async fn build_server_trust_channel(
     let tls_config = ClientTlsConfig::new()
         .ca_certificate(tonic::transport::Certificate::from_pem(trust_bundle_pem))
         .domain_name("fleetos-control");
-
-    let channel = Endpoint::from_shared(address.to_string())
+    let address = ensure_scheme(address);
+    let channel = Endpoint::from_shared(address)
         .map_err(|e| AgentError::Config(format!("invalid endpoint: {}", e)))?
         .tls_config(tls_config)
         .map_err(AgentError::GrpcTransport)?
         .connect()
         .await
         .map_err(AgentError::GrpcTransport)?;
-
     Ok(channel)
 }
 
@@ -37,26 +48,22 @@ pub async fn build_mtls_channel(
     cert_chain_der: &[Vec<u8>],
     private_key_der: &[u8],
 ) -> Result<Channel, AgentError> {
-    // Convert DER to PEM for tonic's Identity builder
     let cert_pem = ders_to_pem(cert_chain_der, "CERTIFICATE");
     let key_pem = der_to_pem(private_key_der, "PRIVATE KEY");
-
     let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
     let ca_cert = tonic::transport::Certificate::from_pem(trust_bundle_pem);
-
     let tls_config = ClientTlsConfig::new()
         .ca_certificate(ca_cert)
         .identity(identity)
         .domain_name("fleetos-control");
-
-    let channel = Endpoint::from_shared(address.to_string())
+    let address = ensure_scheme(address);
+    let channel = Endpoint::from_shared(address)
         .map_err(|e| AgentError::Config(format!("invalid endpoint: {}", e)))?
         .tls_config(tls_config)
         .map_err(AgentError::GrpcTransport)?
         .connect()
         .await
         .map_err(AgentError::GrpcTransport)?;
-
     Ok(channel)
 }
 

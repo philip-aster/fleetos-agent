@@ -34,7 +34,7 @@ pub async fn perform_secure_join(
     tracing::info!("starting secure join flow (CR-10)");
 
     let tpm_endpoint = config.tpm_endpoint();
-    let sealed_store = TpmSealedStore::new(tpm_endpoint.clone());
+    let sealed_store = TpmSealedStore::new(Some(tpm_endpoint.clone()));
 
     // 1. Generate and store X25519 sealing keypair
     let sealing_pubkey_bytes = sealed_store.generate_and_store_sealing_key(storage)?;

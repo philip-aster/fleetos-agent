@@ -20,7 +20,6 @@ pub async fn perform_insecure_join(
         svid,
     };
     use fleetos_core::SpiffeId;
-    use fleetos_core::attestation::quote::TpmQuote;
     use fleetos_core::proto::identity::{
         AttestationQuote as ProtoAttestationQuote, AttestationServiceClient, CaServiceClient,
         CsrRequest, NonceRequest, QuoteType, TrustBundleRequest,
@@ -29,8 +28,11 @@ pub async fn perform_insecure_join(
 
     tracing::warn!("starting INSECURE join flow (testing only)");
 
-    let tpm_endpoint = config.tpm_endpoint();
-    let sealed_store = TpmSealedStore::new(tpm_endpoint);
+    // Insecure mode is join-token-only by definition (R-1 fence): no TPM.
+    // The sealing keypair is stored software-sealed; TPM sealing (Ruling G)
+    // is a secure-mode-only concern. Some(tpm_endpoint) here was a bug —
+    // it made the insecure path probe a TPM and log errors.
+    let sealed_store = TpmSealedStore::new(None);
 
     // 1. Generate and store X25519 sealing keypair
     let sealing_pubkey_bytes = sealed_store.generate_and_store_sealing_key(storage)?;
@@ -87,21 +89,11 @@ pub async fn perform_insecure_join(
         }
     };
 
-    // 5. Build structural TpmQuote (not cryptographically valid)
-    let fake_quote = TpmQuote {
-        quote_bytes: vec![],
-        signature: vec![],
-        nonce: nonce_resp.nonce,
-        pcr_selection: vec![],
-        attestation_key_pub: vec![],
-    };
-    let raw_quote = postcard::to_allocvec(&fake_quote).map_err(AgentError::Serialization)?;
-
     // 6. SubmitQuote — use the PROTO-generated AttestationQuote type
     let _attested_identity = loop {
         let quote = ProtoAttestationQuote {
             quote_type: QuoteType::Tpm2 as i32,
-            raw_quote: raw_quote.clone(),
+            raw_quote: nonce_resp.nonce.clone(),
             raw_signature: vec![],
             join_token: config.join.token.clone(),
             agent_x25519_pubkey: sealing_pubkey.0.to_vec(),

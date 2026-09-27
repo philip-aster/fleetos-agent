@@ -90,8 +90,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage = Arc::new(Storage::open(&config.storage.fjall_path)?);
     tracing::info!(path = %config.storage.fjall_path.display(), "storage opened");
 
-    // --- Phase 3: Keystore (TPM-sealed) ---
-    let tpm_endpoint = config.tpm_endpoint();
+    // --- Phase 3: Keystore ---
+    // Insecure mode: software sealing only (no TPM). Secure mode: TPM sealing.
+    let tpm_endpoint = match config.join.mode {
+        fleetos_agent::config::JoinMode::Insecure => None,
+        fleetos_agent::config::JoinMode::Secure => Some(config.tpm_endpoint()),
+    };
     let keystore = Arc::new(TpmSealedStore::new(tpm_endpoint));
     tracing::info!("keystore initialized");
 
