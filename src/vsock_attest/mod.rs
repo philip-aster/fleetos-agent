@@ -97,6 +97,27 @@ impl VsockAttestServer {
         self.workload_contexts.write().remove(&cid);
     }
 
+    /// Transport seam for the 4-step handshake over a connected stream fd.
+    ///
+    /// Production: the accept loop passes the accepted AF_VSOCK fd plus the
+    /// peer CID extracted from `sockaddr_vm`. Tests: any bidirectional
+    /// byte-stream fd (e.g. a unix socketpair) exercises the identical
+    /// framing, nonce, verification, and config-push logic.
+    pub fn run_handshake(
+        &self,
+        stream: std::os::fd::OwnedFd,
+        peer_cid: u32,
+    ) -> Result<(), AgentError> {
+        handle_connection(
+            stream,
+            peer_cid,
+            &self.verifier,
+            &self.boot_measurements,
+            &self.workload_contexts,
+            &self.config_builder,
+        )
+    }
+
     /// Run the accept loop. Blocks until the shutdown signal fires.
     pub async fn run(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), AgentError> {
         let listener = vsock_listen()?;
@@ -161,10 +182,10 @@ fn handle_connection(
     config_builder: &config_push::WorkloadConfigBuilder,
 ) -> Result<(), AgentError> {
     use fleetos_core::vsock_proto::*;
-    use std::os::fd::AsRawFd;
 
-    let stream = std::fs::File::from(stream);
-    let fd = stream.as_raw_fd();
+    // Sole owner of the connection fd. It is closed exactly once when this
+    // File drops at the end of the handshake.
+    let mut stream = std::fs::File::from(stream);
 
     // Step 1: Send challenge.
     let nonce = fleetos_core::nonce::Nonce::generate();
@@ -172,17 +193,16 @@ fn handle_connection(
         protocol_version: PROTOCOL_VERSION,
         nonce: *nonce.as_bytes(),
     };
-    write_msg(fd, &challenge)?;
+    write_msg(&mut stream, &challenge)?;
     tracing::debug!(peer_cid, "challenge sent");
 
     // Step 2: Receive proof.
-    let proof: VsockAttestationProof = read_msg(fd)?;
+    let proof: VsockAttestationProof = read_msg(&mut stream)?;
     tracing::debug!(peer_cid, quote_type = proof.quote_type, "proof received");
 
     // Step 3: Verify and send result.
     let measurement = measurements.read().get(&peer_cid).cloned();
     let verification = verifier.verify(&proof, &nonce, peer_cid, measurement.as_ref());
-
     let result = match &verification {
         Ok(_) => AgentAttestResult {
             accepted: true,
@@ -193,15 +213,13 @@ fn handle_connection(
             reason: e.to_string(),
         },
     };
-
-    write_msg(fd, &result)?;
+    write_msg(&mut stream, &result)?;
     tracing::debug!(peer_cid, accepted = result.accepted, "result sent");
 
     if result.accepted {
         // Step 4: Push WorkloadConfig using the verified guest identity.
         let verified = verification.unwrap();
         let workload_ctx = workload_contexts.read().get(&peer_cid).cloned();
-
         let config = match workload_ctx {
             Some(ctx) => config_builder.build(&verified, &ctx)?,
             None => {
@@ -209,8 +227,7 @@ fn handle_connection(
                 config_builder.build_fallback(&verified)?
             }
         };
-
-        write_msg(fd, &config)?;
+        write_msg(&mut stream, &config)?;
         tracing::info!(peer_cid, "workload config pushed");
     }
 
@@ -296,48 +313,39 @@ fn vsock_accept(listener_fd: i32) -> Result<(std::os::fd::OwnedFd, u32), AgentEr
 }
 
 // --- Framing I/O (mirrors guest-init's protocol.rs) ---
+//
+// These borrow the connection `File` mutably. `handle_connection` is the sole
+// owner of the fd, so it is closed exactly once when that File drops at the
+// end of the handshake. No raw-fd aliasing, no mem::forget, no double-close.
 
-fn write_msg<T: serde::Serialize>(fd: i32, msg: &T) -> Result<(), AgentError> {
+fn write_msg<T: serde::Serialize>(stream: &mut std::fs::File, msg: &T) -> Result<(), AgentError> {
     use std::io::Write;
-
     let framed = fleetos_core::vsock_proto::frame_msg(msg)
         .map_err(|e| AgentError::Internal(format!("frame_msg failed: {}", e)))?;
-
-    let mut stream = unsafe { std::fs::File::from_raw_fd(fd) };
     stream
         .write_all(&framed)
         .map_err(|e| AgentError::Internal(format!("write failed: {}", e)))?;
-    // Don't close the fd — File::from_raw_fd takes ownership.
-    std::mem::forget(stream);
     Ok(())
 }
 
-fn read_msg<T: serde::de::DeserializeOwned>(fd: i32) -> Result<T, AgentError> {
+fn read_msg<T: serde::de::DeserializeOwned>(stream: &mut std::fs::File) -> Result<T, AgentError> {
     use std::io::Read;
-
-    let mut stream = unsafe { std::fs::File::from_raw_fd(fd) };
-
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
         .map_err(|e| AgentError::Internal(format!("read length failed: {}", e)))?;
     let len = u32::from_le_bytes(len_buf) as usize;
-
     if len > fleetos_core::vsock_proto::MAX_MESSAGE_BYTES {
-        std::mem::forget(stream);
         return Err(AgentError::Internal(format!(
             "message too large: {} bytes (max {})",
             len,
             fleetos_core::vsock_proto::MAX_MESSAGE_BYTES
         )));
     }
-
     let mut buf = vec![0u8; len];
     stream
         .read_exact(&mut buf)
         .map_err(|e| AgentError::Internal(format!("read payload failed: {}", e)))?;
-    std::mem::forget(stream);
-
     fleetos_core::vsock_proto::decode_msg(&buf)
         .map_err(|e| AgentError::Internal(format!("decode_msg failed: {}", e)))
 }

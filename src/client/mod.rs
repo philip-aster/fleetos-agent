@@ -89,10 +89,8 @@ impl ControlPlaneClient {
 
         let private_key_der = self
             .keystore
-            .load_sealing_secret(&self.storage)?
-            .ok_or_else(|| {
-                AgentError::Identity("sealing private key not found in keystore".into())
-            })?;
+            .load_svid_private_key(&self.storage)?
+            .ok_or_else(|| AgentError::Identity("SVID private key not found in keystore".into()))?;
 
         let new_channel = build_mtls_channel(
             &target,
@@ -104,6 +102,11 @@ impl ControlPlaneClient {
 
         *channel_guard = Some(new_channel.clone());
         Ok(new_channel)
+    }
+
+    /// Get the current target address.
+    pub async fn current_target(&self) -> String {
+        self.current_target.read().await.clone()
     }
 
     /// Update the target address (e.g., after a leader redirect).

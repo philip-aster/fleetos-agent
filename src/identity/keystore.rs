@@ -29,6 +29,8 @@ const SOFTWARE_MASTER_KEY_LABEL: &[u8] = b"software_master_key";
 const SEAL_PREFIX_TPM: u8 = 0x01;
 const SEAL_PREFIX_SOFTWARE: u8 = 0x02;
 
+const KEY_SVID_PRIVATE_KEY: &[u8] = b"svid_private_key";
+
 /// Abstract interface for storing and retrieving sensitive key material.
 pub trait SensitiveStore {
     fn store_sealed(
@@ -57,6 +59,11 @@ impl TpmSealedStore {
     /// or `None` for software-only sealing (insecure/testing mode).
     pub fn new(endpoint: Option<TpmEndpoint>) -> Self {
         Self { endpoint }
+    }
+
+    /// Load the SVID private key (used for mTLS client authentication).
+    pub fn load_svid_private_key(&self, storage: &Storage) -> Result<Option<Vec<u8>>, AgentError> {
+        self.load_sealed(storage, KEY_SVID_PRIVATE_KEY)
     }
 
     /// Generate the X25519 sealing keypair, seal the private half, and
