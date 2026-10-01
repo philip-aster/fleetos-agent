@@ -3,7 +3,7 @@
 //!
 //! Flow:
 //!   1. Generate X25519 sealing keypair (TPM-sealed)
-//!   2. Open TPM AttestationSession (creates ephemeral AK + EK)
+//!   2. Open TPM attestation session via TpmContextManager (EK + AK)
 //!   3. RequestActivation → receive MakeCredential challenge
 //!   4. ActivateCredential → recover secret S
 //!   5. Compute activation proof (HMAC of server nonce with S)
@@ -11,7 +11,10 @@
 //!   7. Generate node SVID keypair + CSR
 //!   8. SubmitActivationProof → receive signed SVID
 //!   9. Install SVID into storage
-
+//!
+//! CORE-WI-3: All TPM operations go through a single TpmContextManager.
+//! This avoids the TPM_RC_MEMORY failure that occurred when AttestationSession
+//! held EK+AK (2 slots) while seal_to_pcr needed an SRK (3rd slot) on swtpm.
 use crate::client::channels::build_server_trust_channel;
 use crate::client::retry::{RetryAction, classify_error};
 use crate::config::AgentConfig;
@@ -20,7 +23,7 @@ use crate::identity::keystore::{SensitiveStore, TpmSealedStore};
 use crate::identity::svid;
 use crate::storage::Storage;
 use fleetos_core::attestation::compute_activation_proof;
-use fleetos_core::attestation::tpm::AttestationSession;
+use fleetos_core::attestation::tpm::TpmContextManager;
 use fleetos_core::proto::identity::CaServiceClient;
 use fleetos_core::proto::identity::{
     ActivationProof, ActivationRequest, AttestationServiceClient, TrustBundleRequest,
@@ -40,16 +43,25 @@ pub async fn perform_secure_join(
     let sealing_pubkey_bytes = sealed_store.generate_and_store_sealing_key(storage)?;
     let sealing_pubkey = fleetos_core::crypto::RecipientX25519Pubkey(sealing_pubkey_bytes);
 
-    // 2. Open TPM AttestationSession
-    let mut session = AttestationSession::begin(&tpm_endpoint)
-        .map_err(|e| AgentError::Attestation(format!("TPM session begin failed: {}", e)))?;
+    // 2. Open TPM attestation session via TpmContextManager (CORE-WI-3).
+    //    The manager coordinates transient slot usage: on swtpm, EK and AK
+    //    contexts are saved immediately after creation, freeing all slots
+    //    for subsequent operations like seal_to_pcr.
+    let mut tpm_manager = TpmContextManager::new(&tpm_endpoint)
+        .map_err(|e| AgentError::Attestation(format!("TPM context manager init failed: {}", e)))?;
+    let mut session = tpm_manager
+        .begin_attestation()
+        .map_err(|e| AgentError::Attestation(format!("TPM attestation session failed: {}", e)))?;
 
-    let ak_pub = session
-        .ak_pub()
-        .map_err(|e| AgentError::Attestation(format!("ak_pub failed: {}", e)))?;
-    let ek_pub = session
-        .ek_pub()
-        .map_err(|e| AgentError::Attestation(format!("ek_pub failed: {}", e)))?;
+    // CORE-WI-3: ak_pub()/ek_pub() return &[u8] directly (no Result).
+    let ak_pub = session.ak_pub().to_vec();
+    let ek_pub = session.ek_pub().to_vec();
+
+    // Read EK certificate if available (for EK chain validation by control).
+    let ek_cert_der = tpm_manager
+        .read_ek_cert()
+        .map_err(|e| AgentError::Attestation(format!("read EK cert failed: {}", e)))?
+        .unwrap_or_default();
 
     // 3. Build node SPIFFE ID
     let node_spiffe_id = SpiffeId::new(
@@ -67,7 +79,6 @@ pub async fn perform_secure_join(
         .unwrap_or(&config.control.trust_bundle_path);
     let trust_bundle_pem = std::fs::read_to_string(trust_bundle_path)
         .map_err(|e| AgentError::Config(format!("failed to read trust bundle: {}", e)))?;
-
     let mut channel =
         build_server_trust_channel(&config.control.address, &trust_bundle_pem).await?;
     let mut att_client = AttestationServiceClient::new(channel.clone());
@@ -78,7 +89,7 @@ pub async fn perform_secure_join(
     let challenge = loop {
         let req = ActivationRequest {
             ak_pub: ak_pub.clone(),
-            ek_cert_der: vec![], // No EK cert, just EK pub
+            ek_cert_der: ek_cert_der.clone(),
             ek_pub: ek_pub.clone(),
         };
         match att_client.request_activation(req).await {
@@ -104,9 +115,11 @@ pub async fn perform_secure_join(
         }
     };
 
-    // 6. Activate credential
-    let secret_bytes = session
-        .activate(&challenge.credential_blob, &challenge.secret)
+    // 6. Activate credential via the manager (CORE-WI-3).
+    //    The manager loads EK+AK from saved contexts, performs the
+    //    activation, then saves them back — freeing slots for seal_to_pcr.
+    let secret_bytes = tpm_manager
+        .activate(&mut session, &challenge.credential_blob, &challenge.secret)
         .map_err(|e| AgentError::Attestation(format!("activate failed: {}", e)))?;
     let secret: [u8; 32] = secret_bytes
         .try_into()
@@ -115,17 +128,22 @@ pub async fn perform_secure_join(
     // 7. Compute activation proof
     let hmac = compute_activation_proof(&secret, &challenge.server_nonce);
 
-    // 8. Generate quote
-    let quote_out = session
-        .quote(&challenge.server_nonce, &config.join.pcr_indices)
+    // 8. Generate quote via the manager (CORE-WI-3).
+    let quote_out = tpm_manager
+        .quote(
+            &mut session,
+            &challenge.server_nonce,
+            &config.join.pcr_indices,
+        )
         .map_err(|e| AgentError::Attestation(format!("quote failed: {}", e)))?;
 
-    // 9. Generate node SVID keypair and CSR
+    // 9. Generate node SVID keypair and CSR.
+    //    CORE-WI-3: seal_to_pcr now goes through the same TpmContextManager,
+    //    so it can proceed even while the attestation session is active.
     let svid_keypair = rcgen::KeyPair::generate()
         .map_err(|e| AgentError::Attestation(format!("rcgen keygen failed: {}", e)))?;
     let svid_priv_der = svid_keypair.serialize_der();
     sealed_store.store_sealed(storage, b"svid_private_key", &svid_priv_der)?;
-
     let csr = fleetos_core::spiffe::ca::build_csr(&node_spiffe_id, &svid_keypair)
         .map_err(|e| AgentError::Attestation(format!("build_csr failed: {}", e)))?;
 
@@ -178,6 +196,11 @@ pub async fn perform_secure_join(
         .await
         .map_err(|e| AgentError::JoinFailed(format!("GetTrustBundle failed: {}", e)))?
         .into_inner();
+
+    // 13. Clean up the attestation session (CORE-WI-3).
+    tpm_manager
+        .finish_attestation(session)
+        .map_err(|e| AgentError::Attestation(format!("finish attestation failed: {}", e)))?;
 
     tracing::info!(
         svid_version = svid_resp.svid_version,

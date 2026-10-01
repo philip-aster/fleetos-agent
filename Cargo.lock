@@ -1019,6 +1019,7 @@ dependencies = [
  "base64 0.23.1",
  "blake3",
  "bytemuck",
+ "chacha20poly1305",
  "clap",
  "cloud-hypervisor-client",
  "containerd-client",
@@ -1052,6 +1053,7 @@ dependencies = [
  "tonic-prost",
  "tracing",
  "tracing-subscriber",
+ "tss-esapi",
  "zeroize",
 ]
 
