@@ -286,11 +286,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         control_client.clone(),
         secrets_handler.clone(),
     ));
-    let routes_handle = tokio::spawn(fleetos_agent::wiring::run_routes_watch(
+    // src/main.rs — corrected call site
+    let routes_watch_handle = tokio::spawn(fleetos_agent::wiring::run_routes_watch(
         control_client.clone(),
         config_builder.clone(),
         containerd_adapter.clone(),
+        ebpf_manager.clone(),
         config.node.trust_domain.clone(),
+        config.node.name.clone(), // Phase 7.2.4: thread node name
     ));
     tracing::info!("watch loops started: SAG, Schedule, Events, Routes");
 
@@ -314,7 +317,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sag_watch_handle,
         schedule_handle,
         events_handle,
-        routes_handle,
+        routes_watch_handle,
     );
 
     // Detach eBPF programs.

@@ -18,12 +18,16 @@ use crate::policy::sync::{
     PolicySyncState, apply_mutations_to_state, compile_and_sync, exact_key_bytes,
     wildcard_key_bytes,
 };
+use crate::routes::table::{
+    RouteSyncState, apply_mutations_to_maps,
+    apply_mutations_to_state as apply_mutations_to_state_table, process_route_update,
+};
 use crate::storage::Storage;
 use crate::vsock_attest::config_push::WorkloadConfigBuilder;
 use crate::workloads::{WorkloadManager, WorkloadSpec};
 use fleetos_core::proto::fleetos::watch_event::Event;
 use fleetos_core::proto::fleetos::{RouteEntry, SealedSecret};
-use fleetos_core::spiffe::SpiffeId;
+use fleetos_core::spiffe::{IdKind, SpiffeId};
 use fleetos_core::vsock_proto::DummyIpRouteConfig;
 
 /// WatchSchedule → WorkloadManager reconcile.
@@ -50,18 +54,28 @@ pub async fn run_schedule_watch(
     }
 }
 
-/// WatchRoutes → config_builder dummy_ip_routes + containerd /etc/hosts.
+/// WatchRoutes → config_builder dummy_ip_routes + containerd /etc/hosts + eBPF route maps.
+/// Phase 7.2: Populates DUMMY_IP_ROUTE_MAP and LOCAL_WORKLOADS eBPF maps.
 pub async fn run_routes_watch(
     control_client: Arc<ControlPlaneClient>,
     config_builder: Arc<WorkloadConfigBuilder>,
     containerd: Arc<crate::workloads::containerd::ContainerdAdapter>,
-    _trust_domain: String,
+    ebpf_manager: Arc<std::sync::Mutex<EbpfManager>>,
+    trust_domain: String,
+    node_name: String,
 ) {
+    // Phase 7.2.4: Construct the agent's own node SpiffeId.
+    let own_node_spiffe_id = SpiffeId::new(&trust_domain, "system", IdKind::Node, &node_name);
+
+    // Phase 7.2.1: Own a RouteSyncState instance, initialized empty.
+    let mut route_state = RouteSyncState::new();
+
     let stream = watch::watch_routes(control_client);
     pin_mut!(stream);
     while let Some(result) = stream.next().await {
         match result {
             Ok(update) => {
+                // Phase 7.2.3: Keep existing /etc/hosts injection path.
                 let mut dummy_routes = Vec::new();
                 let mut hosts_lines = vec!["127.0.0.1 localhost".to_string()];
                 for entry in &update.routes {
@@ -76,7 +90,55 @@ pub async fn run_routes_watch(
                 }
                 config_builder.set_dummy_ip_routes(dummy_routes);
                 containerd.set_hosts_content(hosts_lines.join("\n") + "\n");
-                tracing::debug!(routes = update.routes.len(), "route table updated");
+
+                // Phase 7.2.1: Process the route update through routes::table.
+                // This takes the proto RouteUpdate directly and handles conversion.
+                match process_route_update(&route_state, &update, &own_node_spiffe_id) {
+                    Ok(Some(mutations)) => {
+                        // Phase 7.2.2: Lock EbpfManager, apply mutations to eBPF maps.
+                        {
+                            let mut mgr_guard = match ebpf_manager.lock() {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        "EbpfManager lock poisoned during route sync"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let mgr = &mut *mgr_guard;
+                            let dummy_ip_route = &mut mgr.dummy_ip_route;
+                            let local_workloads = &mut mgr.local_workloads;
+
+                            if let Err(e) =
+                                apply_mutations_to_maps(&mutations, dummy_ip_route, local_workloads)
+                            {
+                                tracing::warn!(error = %e, "route map apply failed");
+                                continue;
+                            }
+                        }
+                        // Phase 7.2.2: Update RouteSyncState after successful map application.
+                        apply_mutations_to_state_table(
+                            &mut route_state,
+                            &mutations,
+                            update.version,
+                        );
+                        tracing::info!(
+                            version = update.version,
+                            routes = update.routes.len(),
+                            "route table applied to eBPF maps"
+                        );
+                    }
+                    Ok(None) => {
+                        // Stale update (version <= current), discarded by process_route_update.
+                        tracing::debug!(version = update.version, "stale route update discarded");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "route update processing failed");
+                    }
+                }
             }
             Err(e) => tracing::warn!(error = %e, "watch_routes stream error"),
         }

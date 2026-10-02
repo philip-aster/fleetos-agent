@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Integration test: SAG → policy sync pipeline (Phase 7.1)
 //!
 //! Verifies that compile_and_sync produces correct PolicyMutations
