@@ -68,14 +68,14 @@ impl PolicyMutations {
 }
 
 /// Convert an `EbpfPolicyKey` to its byte representation for tracking.
-fn exact_key_bytes(key: &EbpfPolicyKey) -> [u8; 40] {
+pub(crate) fn exact_key_bytes(key: &EbpfPolicyKey) -> [u8; 40] {
     bytemuck::bytes_of(key)
         .try_into()
         .expect("EbpfPolicyKey is 40 bytes")
 }
 
 /// Convert an `EbpfPolicyWildcardKey` to its byte representation for tracking.
-fn wildcard_key_bytes(key: &EbpfPolicyWildcardKey) -> [u8; 32] {
+pub(crate) fn wildcard_key_bytes(key: &EbpfPolicyWildcardKey) -> [u8; 32] {
     bytemuck::bytes_of(key)
         .try_into()
         .expect("EbpfPolicyWildcardKey is 32 bytes")

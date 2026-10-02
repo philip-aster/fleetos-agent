@@ -1053,7 +1053,6 @@ dependencies = [
  "tonic-prost",
  "tracing",
  "tracing-subscriber",
- "tss-esapi",
  "zeroize",
 ]
 

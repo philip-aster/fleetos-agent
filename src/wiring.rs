@@ -14,6 +14,10 @@ use crate::ebpf::EbpfManager;
 use crate::error::AgentError;
 use crate::identity::keystore::TpmSealedStore;
 use crate::identity::svid::SvidState;
+use crate::policy::sync::{
+    PolicySyncState, apply_mutations_to_state, compile_and_sync, exact_key_bytes,
+    wildcard_key_bytes,
+};
 use crate::storage::Storage;
 use crate::vsock_attest::config_push::WorkloadConfigBuilder;
 use crate::workloads::{WorkloadManager, WorkloadSpec};
@@ -91,16 +95,23 @@ fn route_to_dummy_ip_config(entry: &RouteEntry) -> Option<DummyIpRouteConfig> {
 }
 
 /// WatchSag → policy sync (eBPF map population).
+/// Phase 7.1: Owns PolicySyncState, threads data_trust_domain.
 pub async fn run_sag_watch(
     control_client: Arc<ControlPlaneClient>,
     ebpf_manager: Arc<std::sync::Mutex<EbpfManager>>,
+    data_trust_domain: String,
 ) {
+    // Phase 7.1.2: Own a PolicySyncState instance, initialized empty, version 0.
+    let mut sync_state = PolicySyncState::new();
+
     let stream = watch::watch_sag(control_client);
     pin_mut!(stream);
     while let Some(result) = stream.next().await {
         match result {
             Ok(update) => {
-                if let Err(e) = sync_policy(&ebpf_manager, &update) {
+                if let Err(e) =
+                    sync_policy(&ebpf_manager, &mut sync_state, &update, &data_trust_domain)
+                {
                     tracing::warn!(error = %e, "policy sync failed");
                 } else {
                     tracing::debug!(
@@ -116,19 +127,76 @@ pub async fn run_sag_watch(
 }
 
 /// Apply a SagUpdate to the eBPF policy maps.
-/// TODO: Wire to fleetos-policy-compiler once its public API is stabilized.
-/// For now, log the update and return Ok (fail-closed: no policy = default deny).
+/// Phase 7.1.1: Full implementation replacing the no-op stub.
+///
+/// Pipeline: compile_and_sync → apply mutations to eBPF maps → update state.
+/// Stale frames (version ≤ current) are discarded by compile_and_sync returning None.
 fn sync_policy(
-    _ebpf_manager: &Arc<std::sync::Mutex<EbpfManager>>,
-    update: &fleetos_core::proto::fleetos::SagUpdate,
+    ebpf_manager: &Arc<std::sync::Mutex<EbpfManager>>,
+    sync_state: &mut PolicySyncState,
+    update: &fleetos_core::proto::state::SagUpdate,
+    data_trust_domain: &str,
 ) -> Result<(), AgentError> {
+    // Phase 7.1.1: Call compile_and_sync with current state, proto rules, version, trust domain.
+    // Returns None if the update is stale (version ≤ current).
+    let result = compile_and_sync(sync_state, &update.rules, update.version, data_trust_domain)?;
+
+    let Some((mutations, _compiled)) = result else {
+        // Stale frame — compile_and_sync already logged it. Nothing to apply.
+        return Ok(());
+    };
+
+    // Phase 7.1.4: Lock the manager, apply mutations to eBPF maps, release lock.
+    {
+        let mut mgr = ebpf_manager
+            .lock()
+            .map_err(|e| AgentError::Ebpf(format!("EbpfManager lock poisoned: {}", e)))?;
+
+        // Apply exact insertions.
+        for (key, value) in &mutations.insert_exact {
+            let key_bytes = exact_key_bytes(key);
+            let value_bytes: [u8; 16] = unsafe { std::mem::transmute(*value) };
+            mgr.policy_exact
+                .insert(&key_bytes, &value_bytes, 0)
+                .map_err(|e| AgentError::Ebpf(format!("POLICY_EXACT insert failed: {}", e)))?;
+        }
+
+        // Apply exact deletions.
+        for key_bytes in &mutations.delete_exact {
+            mgr.policy_exact
+                .remove(key_bytes)
+                .map_err(|e| AgentError::Ebpf(format!("POLICY_EXACT remove failed: {}", e)))?;
+        }
+
+        // Apply wildcard insertions.
+        for (key, value) in &mutations.insert_wildcard {
+            let key_bytes = wildcard_key_bytes(key);
+            let value_bytes: [u8; 16] = unsafe { std::mem::transmute(*value) };
+            mgr.policy_wildcard
+                .insert(&key_bytes, &value_bytes, 0)
+                .map_err(|e| AgentError::Ebpf(format!("POLICY_WILDCARD insert failed: {}", e)))?;
+        }
+
+        // Apply wildcard deletions.
+        for key_bytes in &mutations.delete_wildcard {
+            mgr.policy_wildcard
+                .remove(key_bytes)
+                .map_err(|e| AgentError::Ebpf(format!("POLICY_WILDCARD remove failed: {}", e)))?;
+        }
+    } // Lock released here.
+
+    // Phase 7.1.1: Update PolicySyncState after successful map application.
+    apply_mutations_to_state(sync_state, &mutations, update.version);
+
     tracing::info!(
         version = update.version,
-        rules = update.rules.len(),
-        revoked = update.revoked_spiffe_ids.len(),
-        "SAG update received (policy compiler wiring pending)"
+        inserted_exact = mutations.insert_exact.len(),
+        deleted_exact = mutations.delete_exact.len(),
+        inserted_wildcard = mutations.insert_wildcard.len(),
+        deleted_wildcard = mutations.delete_wildcard.len(),
+        "SAG update applied to eBPF policy maps"
     );
-    // Default-deny is already enforced by eBPF; no action needed until compiler is wired.
+
     Ok(())
 }
 

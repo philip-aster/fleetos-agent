@@ -272,9 +272,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("counters reporter started");
 
     // --- Phase 12: Watch loops (SAG, Schedule, Events, Routes) ---
-    let sag_handle = tokio::spawn(fleetos_agent::wiring::run_sag_watch(
+    // Replace the run_sag_watch spawn:
+    let sag_watch_handle = tokio::spawn(fleetos_agent::wiring::run_sag_watch(
         control_client.clone(),
         ebpf_manager.clone(),
+        config.node.trust_domain.clone(),
     ));
     let schedule_handle = tokio::spawn(fleetos_agent::wiring::run_schedule_watch(
         control_client.clone(),
@@ -309,7 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         flow_handle,
         pod_event_handle,
         counters_handle,
-        sag_handle,
+        sag_watch_handle,
         schedule_handle,
         events_handle,
         routes_handle,
