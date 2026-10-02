@@ -28,6 +28,8 @@ use self::microvm::{MicroVmAdapter, VsockCidAllocator};
 use self::pod_manager::{Pod, PodManager, PodState};
 use self::reconciler::Reconciler;
 use self::volumes::{PreparedMount, VolumeConfig};
+use fleetos_core::hash::IdentityFingerprint;
+use fleetos_core::spiffe::{IdKind, SpiffeId, WorkloadRole};
 
 /// Runtime kind for a workload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -194,7 +196,13 @@ impl WorkloadManager {
         // Record the pod in the pod manager.
         // (Fingerprint here is a placeholder; real fingerprint is set when the
         //  workload's SPIFFE ID is known. Wiring refined in Phase 5.)
-        let fp = fleetos_core::hash::IdentityFingerprint([0; 16]);
+        // 7.6.1: real fingerprint from the workload's SPIFFE identity + role.
+        let fp = workload_fingerprint(
+            &self.trust_domain,
+            &pod_spec.tenant_id,
+            &spec.workload_id,
+            &spec.role,
+        )?;
         let mut pod = Pod::new(
             pod_id,
             spec.workload_id.clone(),
@@ -297,4 +305,22 @@ impl WorkloadManager {
             .ok_or_else(|| AgentError::Workload(format!("no MicroVM for cid {vsock_cid}")))?;
         adapter.resize(vcpus, memory_mb).await
     }
+}
+
+/// Compute a workload's canonical identity fingerprint.
+///
+/// 7.6.1 / Rule #1: uses `IdentityFingerprint::of` ONLY — never
+/// `of_with_ordinal` — so every replica of a (tenant, service, role) shares a
+/// single fingerprint and role-based load balancing works. Never the zero
+/// placeholder.
+pub fn workload_fingerprint(
+    trust_domain: &str,
+    tenant_id: &str,
+    workload_id: &str,
+    role: &str,
+) -> Result<IdentityFingerprint, AgentError> {
+    let spiffe = SpiffeId::new(trust_domain, tenant_id, IdKind::Sa, workload_id);
+    let role = WorkloadRole::try_from(role)
+        .map_err(|e| AgentError::Workload(format!("invalid workload role {role:?}: {e}")))?;
+    Ok(IdentityFingerprint::of(&spiffe, Some(&role)))
 }

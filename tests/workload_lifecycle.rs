@@ -13,6 +13,7 @@
 //! and is covered by SDK verification points; this file tests orchestration.
 
 use fleetos_agent::error::AgentError;
+use fleetos_agent::workloads::workload_fingerprint;
 use fleetos_agent::workloads::{
     NetGuard, RuntimeKind, WorkloadManager, WorkloadSpec,
     containerd::ContainerdAdapter,
@@ -27,6 +28,7 @@ use fleetos_core::proto::fleetos::HostPath;
 use fleetos_core::proto::fleetos::Volume;
 use fleetos_core::proto::fleetos::volume::Source;
 use fleetos_core::proto::workload::{PodSpec, RestartPolicy, VolumeMount};
+use fleetos_core::spiffe::{IdKind, SpiffeId, WorkloadRole};
 use std::sync::{Arc, Mutex};
 
 // --- Mock NetGuard: records arm() calls, optionally fails arm ---
@@ -356,4 +358,23 @@ async fn boot_containerd_does_not_arm_net_guard() {
     // Boot fails without real containerd; no pod registered.
     let pm = pod_manager.read().await;
     assert!(pm.is_empty());
+}
+
+#[test]
+fn boot_fingerprint_is_real_and_canonical() {
+    let fp = workload_fingerprint("fleet.test.internal", "tenant-1", "web", "primary")
+        .expect("fingerprint must compute");
+    // 7.6.3: must NOT be the zero placeholder.
+    assert_ne!(fp, IdentityFingerprint([0; 16]));
+    // Must equal IdentityFingerprint::of computed the same way (Rule #1).
+    let spiffe = SpiffeId::new("fleet.test.internal", "tenant-1", IdKind::Sa, "web");
+    let role = WorkloadRole::try_from("primary").unwrap();
+    assert_eq!(fp, IdentityFingerprint::of(&spiffe, Some(&role)));
+
+    // Deterministic, and role is part of the identity.
+    let fp2 = workload_fingerprint("fleet.test.internal", "tenant-1", "web", "primary").unwrap();
+    assert_eq!(fp, fp2);
+    let fp_replica =
+        workload_fingerprint("fleet.test.internal", "tenant-1", "web", "replica").unwrap();
+    assert_ne!(fp, fp_replica);
 }
