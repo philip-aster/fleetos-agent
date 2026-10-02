@@ -172,9 +172,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wrap for shared access (NetGuard needs &mut Ebpf for TC attach at VM boot).
     let ebpf_manager = std::sync::Arc::new(std::sync::Mutex::new(ebpf_manager));
-    let net_guard = std::sync::Arc::new(
-        fleetos_agent::ebpf::net_guard_adapter::VmNetGuardAdapter::new(ebpf_manager.clone())?,
-    );
 
     // --- Phase 7: Shared state ---
     let pod_manager = Arc::new(RwLock::new(PodManager::new()));
@@ -185,12 +182,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fleetos_agent::workloads::containerd::ContainerdAdapter::new_lazy("fleetos", String::new()),
     );
     let volume_config = fleetos_agent::workloads::volumes::VolumeConfig::default();
+    let net_guard_adapter = std::sync::Arc::new(
+        fleetos_agent::ebpf::net_guard_adapter::VmNetGuardAdapter::new(ebpf_manager.clone())?,
+    );
+    let net_guard: Option<std::sync::Arc<dyn fleetos_agent::workloads::NetGuard>> =
+        Some(net_guard_adapter.clone());
+    let src_identity: Option<std::sync::Arc<dyn fleetos_agent::workloads::SrcIdentityRegistry>> =
+        Some(net_guard_adapter.clone());
+    let ip_allocator = std::sync::Arc::new(std::sync::Mutex::new(
+        fleetos_agent::workloads::NodeIpAllocator::new(&config.networking.workload_ip_cidr)?,
+    ));
+
     let workload_manager = std::sync::Arc::new(fleetos_agent::workloads::WorkloadManager::new(
         containerd_adapter.clone(),
         volume_config,
         pod_manager.clone(),
-        Some(net_guard.clone()),
+        net_guard,
         config.node.trust_domain.clone(),
+        src_identity,
+        ip_allocator,
     ));
 
     let secrets_handler = std::sync::Arc::new(fleetos_agent::wiring::SecretsHandler::new(

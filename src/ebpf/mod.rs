@@ -34,6 +34,10 @@ pub struct EbpfManager {
     /// Phase 7.2: Route maps stored for sync access.
     pub dummy_ip_route: HashMap<aya::maps::MapData, u32, [u8; 40]>,
     pub local_workloads: HashMap<aya::maps::MapData, [u8; 16], u8>,
+    /// Phase 7.2.5: SRC_IDENTITY_MAP (workload source IP -> identity fingerprint).
+    /// Taken once in `load()`; accessed under the `Arc<Mutex<>>` lock by
+    /// `VmNetGuardAdapter`'s `SrcIdentityRegistry` impl.
+    pub src_identity_map: HashMap<aya::maps::MapData, u32, [u8; 16]>,
 }
 
 impl EbpfManager {
@@ -49,6 +53,7 @@ impl EbpfManager {
         let policy_wildcard = maps::policy_wildcard_map(&mut ebpf)?;
         let dummy_ip_route = maps::dummy_ip_route_map(&mut ebpf)?;
         let local_workloads = maps::local_workloads_map(&mut ebpf)?;
+        let src_identity_map = maps::src_identity_map(&mut ebpf)?;
         Ok(Self {
             ebpf,
             config: config.clone(),
@@ -57,6 +62,7 @@ impl EbpfManager {
             policy_wildcard,
             dummy_ip_route,
             local_workloads,
+            src_identity_map,
         })
     }
     // ... attach_nodewide_cgroup_programs and check_map_capacity unchanged ...

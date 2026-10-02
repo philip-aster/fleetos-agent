@@ -32,6 +32,9 @@ pub struct AgentConfig {
     /// VSOCK attestation server configuration (for MicroVM guest attestation).
     #[serde(default)]
     pub vsock_attest: VsockAttestConfig,
+    /// Networking configuration.
+    #[serde(default)]
+    pub networking: NetworkingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -80,6 +83,28 @@ impl Default for JoinConfig {
             join_token_path: None,
             trust_bundle_path: None,
             pcr_indices: default_pcr_indices(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NetworkingConfig {
+    /// Node-local CIDR for workload source IPs (MicroVM guest IPs).
+    /// Node-local only; not globally routable (Option B: agent assigns).
+    /// Must NOT overlap 240.0.0.0/4 (dummy/service address space) —
+    /// NodeIpAllocator::new enforces this at startup.
+    #[serde(default = "default_workload_ip_cidr")]
+    pub workload_ip_cidr: String,
+}
+
+fn default_workload_ip_cidr() -> String {
+    "172.30.0.0/16".to_string()
+}
+
+impl Default for NetworkingConfig {
+    fn default() -> Self {
+        Self {
+            workload_ip_cidr: default_workload_ip_cidr(),
         }
     }
 }

@@ -15,7 +15,7 @@
 use fleetos_agent::error::AgentError;
 use fleetos_agent::workloads::workload_fingerprint;
 use fleetos_agent::workloads::{
-    NetGuard, RuntimeKind, WorkloadManager, WorkloadSpec,
+    NetGuard, NodeIpAllocator, RuntimeKind, SrcIdentityRegistry, WorkloadManager, WorkloadSpec,
     containerd::ContainerdAdapter,
     lifecycle::{PodLifecycle, next_state},
     pod_manager::{Pod, PodManager, PodState},
@@ -29,6 +29,7 @@ use fleetos_core::proto::fleetos::Volume;
 use fleetos_core::proto::fleetos::volume::Source;
 use fleetos_core::proto::workload::{PodSpec, RestartPolicy, VolumeMount};
 use fleetos_core::spiffe::{IdKind, SpiffeId, WorkloadRole};
+use fleetos_ebpf_common::HostOrderIpv4;
 use std::sync::{Arc, Mutex};
 
 // --- Mock NetGuard: records arm() calls, optionally fails arm ---
@@ -91,14 +92,87 @@ fn make_manager_parts(
         allow_host_path: false,
     };
     let pod_manager = Arc::new(tokio::sync::RwLock::new(PodManager::new()));
+    let ip_allocator = Arc::new(std::sync::Mutex::new(
+        NodeIpAllocator::new("172.30.0.0/16").unwrap(),
+    ));
     let wm = WorkloadManager::new(
         containerd,
         volume_config,
         pod_manager.clone(),
         net_guard,
         "test.internal".to_string(),
+        None,
+        ip_allocator,
     );
     (wm, pod_manager)
+}
+
+#[derive(Default)]
+struct MockSrcIdentityRegistry {
+    registered: std::sync::Mutex<Vec<(u32, IdentityFingerprint)>>,
+    unregistered: std::sync::Mutex<Vec<u32>>,
+}
+impl SrcIdentityRegistry for MockSrcIdentityRegistry {
+    fn register(&self, ip: HostOrderIpv4, fp: &IdentityFingerprint) -> Result<(), AgentError> {
+        self.registered.lock().unwrap().push((ip.0, *fp));
+        Ok(())
+    }
+    fn unregister(&self, ip: HostOrderIpv4) -> Result<(), AgentError> {
+        self.unregistered.lock().unwrap().push(ip.0);
+        Ok(())
+    }
+}
+
+#[test]
+fn node_ip_allocator_allocates_reuses_and_rejects_dummy_space() {
+    let mut a = NodeIpAllocator::new("172.30.0.0/24").unwrap();
+    let x = a.allocate("p1").unwrap();
+    let y = a.allocate("p2").unwrap();
+    assert_ne!(x, y);
+    assert_eq!(x, 0xAC1E0001); // 172.30.0.1
+    a.release("p1");
+    assert_eq!(a.allocate("p3").unwrap(), x); // reused
+    assert!(NodeIpAllocator::new("240.0.0.0/24").is_err()); // dummy space rejected
+}
+
+#[tokio::test]
+async fn boot_microvm_registers_src_identity_and_cleans_up_on_failure() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(MockSrcIdentityRegistry::default());
+    let ip_alloc = Arc::new(std::sync::Mutex::new(
+        NodeIpAllocator::new("172.30.0.0/16").unwrap(),
+    ));
+    let wm = WorkloadManager::new(
+        Arc::new(ContainerdAdapter::new_lazy("fleetos", String::new())),
+        VolumeConfig {
+            scratch_root: tempdir.path().to_path_buf(),
+            allow_host_path: false,
+        },
+        Arc::new(tokio::sync::RwLock::new(PodManager::new())),
+        Some(Arc::new(MockNetGuard::new(false))),
+        "test.internal".to_string(),
+        Some(registry.clone()),
+        ip_alloc.clone(),
+    );
+    let spec = make_spec("web", RuntimeKind::CloudHypervisor);
+    wm.reconcile(&[spec]).await.unwrap(); // boot fails (no CH); reconcile swallows
+    let reg = registry.registered.lock().unwrap();
+    assert_eq!(reg.len(), 1, "registered before boot");
+    assert_ne!(
+        reg[0].1,
+        IdentityFingerprint([0; 16]),
+        "real fingerprint, not zero"
+    );
+    assert_eq!(
+        registry.unregistered.lock().unwrap().len(),
+        1,
+        "unregistered on boot failure"
+    );
+    assert_eq!(
+        ip_alloc.lock().unwrap().allocated_count(),
+        0,
+        "IP released on failure"
+    );
 }
 
 // =========================================================================

@@ -9,7 +9,11 @@ use aya::maps::Array;
 use crate::ebpf::EbpfManager;
 use crate::ebpf::programs::VmNetGuard;
 use crate::error::AgentError;
+use crate::routes::table::{register_src_identity, unregister_src_identity};
 use crate::workloads::NetGuard;
+use crate::workloads::SrcIdentityRegistry;
+use fleetos_core::hash::IdentityFingerprint;
+use fleetos_ebpf_common::HostOrderIpv4;
 
 /// Adapter bridging the eBPF VmNetGuard to the workloads-layer NetGuard trait.
 pub struct VmNetGuardAdapter {
@@ -69,5 +73,20 @@ impl NetGuard for VmNetGuardAdapter {
         }
         tracing::info!(interface, "VmNetGuard disarmed");
         Ok(())
+    }
+}
+
+impl SrcIdentityRegistry for VmNetGuardAdapter {
+    fn register(
+        &self,
+        source_ip: HostOrderIpv4,
+        fingerprint: &IdentityFingerprint,
+    ) -> Result<(), AgentError> {
+        let mut mgr = self.manager.lock().unwrap();
+        register_src_identity(&mut mgr.src_identity_map, source_ip, fingerprint)
+    }
+    fn unregister(&self, source_ip: HostOrderIpv4) -> Result<(), AgentError> {
+        let mut mgr = self.manager.lock().unwrap();
+        unregister_src_identity(&mut mgr.src_identity_map, source_ip)
     }
 }

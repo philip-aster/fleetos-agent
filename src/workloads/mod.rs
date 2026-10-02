@@ -30,6 +30,9 @@ use self::reconciler::Reconciler;
 use self::volumes::{PreparedMount, VolumeConfig};
 use fleetos_core::hash::IdentityFingerprint;
 use fleetos_core::spiffe::{IdKind, SpiffeId, WorkloadRole};
+use fleetos_ebpf_common::HostOrderIpv4;
+use std::collections::HashSet;
+use std::sync::Mutex as StdMutex;
 
 /// Runtime kind for a workload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -123,6 +126,12 @@ pub struct WorkloadManager {
     /// Live MicroVM adapters keyed by vsock_cid.
     microvms: Arc<RwLock<HashMap<u32, Arc<MicroVmAdapter>>>>,
     trust_domain: String,
+    /// Source-identity registry (SRC_IDENTITY_MAP), injected (7.2.5).
+    src_identity: Option<Arc<dyn SrcIdentityRegistry>>,
+    /// Node-local workload IP allocator (7.2.5 / Option B).
+    ip_allocator: Arc<StdMutex<NodeIpAllocator>>,
+    /// Allocated source IPs per pod (pod_id -> host-order IP), for release on stop.
+    pod_source_ips: Arc<StdMutex<HashMap<String, u32>>>,
 }
 
 impl WorkloadManager {
@@ -132,6 +141,8 @@ impl WorkloadManager {
         pod_manager: Arc<RwLock<PodManager>>,
         net_guard: Option<Arc<dyn NetGuard>>,
         trust_domain: String,
+        src_identity: Option<Arc<dyn SrcIdentityRegistry>>,
+        ip_allocator: Arc<StdMutex<NodeIpAllocator>>,
     ) -> Self {
         Self {
             containerd,
@@ -141,6 +152,9 @@ impl WorkloadManager {
             net_guard,
             microvms: Arc::new(RwLock::new(HashMap::new())),
             trust_domain,
+            src_identity,
+            ip_allocator,
+            pod_source_ips: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -174,28 +188,16 @@ impl WorkloadManager {
             .pod_spec
             .as_ref()
             .ok_or_else(|| AgentError::Workload("boot requires full PodSpec".into()))?;
-
         let pod_id = pod_spec
             .pod_id
             .clone()
             .unwrap_or_else(|| spec.workload_id.clone());
-
-        // Prepare volumes (EmptyDir per-pod; HostPath gated).
         let mounts = volumes::prepare_mounts(
             &self.volume_config,
             &pod_id,
             &pod_spec.volumes,
             &pod_spec.volume_mounts,
         )?;
-
-        let handle = match spec.runtime {
-            RuntimeKind::Containerd => self.boot_containerd(spec, &mounts).await?,
-            RuntimeKind::CloudHypervisor => self.boot_microvm(spec, &mounts).await?,
-        };
-
-        // Record the pod in the pod manager.
-        // (Fingerprint here is a placeholder; real fingerprint is set when the
-        //  workload's SPIFFE ID is known. Wiring refined in Phase 5.)
         // 7.6.1: real fingerprint from the workload's SPIFFE identity + role.
         let fp = workload_fingerprint(
             &self.trust_domain,
@@ -203,8 +205,40 @@ impl WorkloadManager {
             &spec.workload_id,
             &spec.role,
         )?;
+        // 7.2.5 (Option B): MicroVM gets an agent-assigned node-local source IP,
+        // registered in SRC_IDENTITY_MAP before boot so the guest's first packet
+        // is attributable (fail-closed otherwise). Containerd IP discovery is a
+        // follow-up (runtime assigns the IP post-start).
+        let mut registered_ip: Option<HostOrderIpv4> = None;
+        if spec.runtime == RuntimeKind::CloudHypervisor {
+            if let Some(registry) = &self.src_identity {
+                let src_ip = self.ip_allocator.lock().unwrap().allocate(&pod_id)?;
+                let ho = HostOrderIpv4(src_ip);
+                if let Err(e) = registry.register(ho, &fp) {
+                    self.ip_allocator.lock().unwrap().release(&pod_id);
+                    return Err(e);
+                }
+                registered_ip = Some(ho);
+                // TODO(7.7): feed src_ip into WorkloadContext.guest_ip for guest-init.
+            }
+        }
+        let boot_result = match spec.runtime {
+            RuntimeKind::Containerd => self.boot_containerd(spec, &mounts).await,
+            RuntimeKind::CloudHypervisor => self.boot_microvm(spec, &mounts).await,
+        };
+        let handle = match boot_result {
+            Ok(h) => h,
+            Err(e) => {
+                // Boot failed: release the registered identity + IP (no leak).
+                if let (Some(registry), Some(ho)) = (&self.src_identity, registered_ip) {
+                    let _ = registry.unregister(ho);
+                    self.ip_allocator.lock().unwrap().release(&pod_id);
+                }
+                return Err(e);
+            }
+        };
         let mut pod = Pod::new(
-            pod_id,
+            pod_id.clone(),
             spec.workload_id.clone(),
             pod_spec.tenant_id.clone(),
             spec.role.clone(),
@@ -213,8 +247,13 @@ impl WorkloadManager {
         );
         pod.state = PodState::Booting;
         pod.pid = Some(handle);
+        if let Some(ho) = registered_ip {
+            self.pod_source_ips
+                .lock()
+                .unwrap()
+                .insert(pod_id.clone(), ho.0);
+        }
         self.pod_manager.write().await.add_pod(pod);
-
         Ok(handle)
     }
 
@@ -282,6 +321,16 @@ impl WorkloadManager {
             }
         }
 
+        // 7.2.5: unregister source identity + release node-local IP.
+        if let Some(src_ip) = self.pod_source_ips.lock().unwrap().remove(pod_id) {
+            if let Some(registry) = &self.src_identity {
+                if let Err(e) = registry.unregister(HostOrderIpv4(src_ip)) {
+                    tracing::warn!(pod_id, error = %e, "SRC_IDENTITY_MAP unregister failed");
+                }
+            }
+            self.ip_allocator.lock().unwrap().release(pod_id);
+        }
+
         // Tear down per-pod EmptyDir scratch.
         volumes::teardown_pod_scratch(&self.volume_config, pod_id)?;
 
@@ -323,4 +372,110 @@ pub fn workload_fingerprint(
     let role = WorkloadRole::try_from(role)
         .map_err(|e| AgentError::Workload(format!("invalid workload role {role:?}: {e}")))?;
     Ok(IdentityFingerprint::of(&spiffe, Some(&role)))
+}
+
+/// Source-identity registry seam (7.2.5 / Option B). Implemented by the eBPF
+/// layer (`VmNetGuardAdapter`) and injected so the workloads layer stays
+/// eBPF-free — same precedent as `NetGuard`.
+pub trait SrcIdentityRegistry: Send + Sync {
+    fn register(
+        &self,
+        source_ip: HostOrderIpv4,
+        fingerprint: &IdentityFingerprint,
+    ) -> Result<(), AgentError>;
+    fn unregister(&self, source_ip: HostOrderIpv4) -> Result<(), AgentError>;
+}
+
+/// Node-local workload IP allocator (7.2.5 / Option B).
+///
+/// Assigns each MicroVM a node-local source IP at boot. The range is
+/// node-local and NOT globally routable; control-side per-node subnet
+/// assignment is a future mechanism. Rejects ranges inside the 240.0.0.0/4
+/// dummy space (reserved for service identities).
+pub struct NodeIpAllocator {
+    base: u32,
+    host_count: u32,
+    next_offset: u32,
+    free: HashSet<u32>,
+    allocated: HashMap<u32, String>, // offset -> pod_id
+}
+
+impl NodeIpAllocator {
+    pub fn new(cidr: &str) -> Result<Self, AgentError> {
+        let (ip, prefix) = parse_cidr(cidr)?;
+        if !(8..=28).contains(&prefix) {
+            return Err(AgentError::Workload(format!(
+                "workload_ip_cidr prefix /{prefix} outside 8..=28"
+            )));
+        }
+        let mask = if prefix == 0 {
+            0
+        } else {
+            !0u32 << (32 - prefix)
+        };
+        let base = ip & mask;
+        // Reject overlap with the 240.0.0.0/4 dummy space.
+        if base >> 28 == 0xF {
+            return Err(AgentError::Workload(
+                "workload_ip_cidr overlaps the 240.0.0.0/4 dummy space".into(),
+            ));
+        }
+        let host_count = 1u32 << (32 - prefix);
+        Ok(Self {
+            base,
+            host_count,
+            next_offset: 1,
+            free: HashSet::new(),
+            allocated: HashMap::new(),
+        })
+    }
+
+    pub fn allocate(&mut self, pod_id: &str) -> Result<u32, AgentError> {
+        let offset = if let Some(o) = self.free.iter().next().copied() {
+            self.free.remove(&o);
+            o
+        } else {
+            let o = self.next_offset;
+            if o >= self.host_count - 1 {
+                return Err(AgentError::Workload(
+                    "node workload IP space exhausted".into(),
+                ));
+            }
+            self.next_offset += 1;
+            o
+        };
+        self.allocated.insert(offset, pod_id.to_string());
+        Ok(self.base + offset)
+    }
+
+    pub fn release(&mut self, pod_id: &str) {
+        self.allocated.retain(|offset, pid| {
+            if pid == pod_id {
+                self.free.insert(*offset);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    pub fn allocated_count(&self) -> usize {
+        self.allocated.len()
+    }
+}
+
+fn parse_cidr(cidr: &str) -> Result<(u32, u32), AgentError> {
+    let (addr, prefix) = cidr
+        .split_once('/')
+        .ok_or_else(|| AgentError::Workload("CIDR missing /prefix".into()))?;
+    let ip: std::net::Ipv4Addr = addr
+        .parse()
+        .map_err(|e| AgentError::Workload(format!("bad CIDR address: {e}")))?;
+    let prefix: u32 = prefix
+        .parse()
+        .map_err(|e| AgentError::Workload(format!("bad CIDR prefix: {e}")))?;
+    if prefix > 32 {
+        return Err(AgentError::Workload("CIDR prefix > 32".into()));
+    }
+    Ok((u32::from_be_bytes(ip.octets()), prefix))
 }

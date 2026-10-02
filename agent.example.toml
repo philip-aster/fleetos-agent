@@ -78,3 +78,11 @@ port = 18001  # 0x4649
 # kernel_path = "/var/lib/fleetos/vmlinux"
 # rootfs_path = "/var/lib/fleetos/rootfs.erofs"
 # guest_init_path = "/usr/lib/fleetos/fleetos-guest-init"
+
+# ---------------------------------------------------------------------------
+# Networking (MicroVM workload source IPs)
+# ---------------------------------------------------------------------------
+[networking]
+# Node-local CIDR for MicroVM workload source IPs (SRC_IDENTITY_MAP keying).
+# Must not overlap 240.0.0.0/4. Agent-local only; not globally routable.
+workload_ip_cidr = "172.30.0.0/16"
