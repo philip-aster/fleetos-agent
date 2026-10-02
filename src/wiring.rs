@@ -22,6 +22,7 @@ use crate::routes::table::{
     RouteSyncState, apply_mutations_to_maps,
     apply_mutations_to_state as apply_mutations_to_state_table, process_route_update,
 };
+use crate::secret::deliver::deliver_secret;
 use crate::storage::Storage;
 use crate::vsock_attest::config_push::WorkloadConfigBuilder;
 use crate::workloads::{WorkloadManager, WorkloadSpec};
@@ -29,6 +30,7 @@ use fleetos_core::proto::fleetos::watch_event::Event;
 use fleetos_core::proto::fleetos::{RouteEntry, SealedSecret};
 use fleetos_core::spiffe::{IdKind, SpiffeId};
 use fleetos_core::vsock_proto::DummyIpRouteConfig;
+use zeroize::Zeroizing;
 
 /// WatchSchedule → WorkloadManager reconcile.
 pub async fn run_schedule_watch(
@@ -296,7 +298,8 @@ pub struct SecretsHandler {
     storage: Arc<Storage>,
     keystore: Arc<TpmSealedStore>,
     svid_state: Arc<RwLock<SvidState>>,
-    secrets: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    // Plaintext held in Zeroizing so it's scrubbed on drop (Ruling G hygiene).
+    secrets: Arc<RwLock<HashMap<String, Zeroizing<Vec<u8>>>>>,
 }
 
 impl SecretsHandler {
@@ -327,31 +330,41 @@ impl SecretsHandler {
     ) -> Result<(), AgentError> {
         let sealed = unary::fetch_secret(&self.control_client, spiffe_id, svid_version).await?;
         let plaintext = self.unseal(&sealed)?;
+        // Deliver to disk first; only cache in memory once the write succeeds.
+        self.deliver(spiffe_id, &plaintext).await?;
         self.secrets
             .write()
             .await
-            .insert(spiffe_id.to_string(), plaintext.clone());
-        self.deliver(spiffe_id, &plaintext).await?;
+            .insert(spiffe_id.to_string(), plaintext);
         tracing::info!(spiffe_id, "secret delivered");
         Ok(())
     }
 
-    fn unseal(&self, sealed: &SealedSecret) -> Result<Vec<u8>, AgentError> {
+    // 7.3.1 / 7.3.2: load the node X25519 sealing key, then delegate to the
+    // tested replay-check → proto→core → unseal pipeline in secret::deliver.
+    fn unseal(&self, sealed: &SealedSecret) -> Result<Zeroizing<Vec<u8>>, AgentError> {
         let node_private_key = self
             .keystore
             .load_sealing_secret(&self.storage)?
             .ok_or_else(|| AgentError::Secret("node sealing private key missing".into()))?;
-
-        // TODO: Wire to fleetos_core::crypto::unseal once the API is finalized.
-        // For now, fail-closed: return an error to prevent plaintext leakage.
-        let _ = node_private_key;
-        let _ = sealed;
-        Err(AgentError::Secret(
-            "X25519 unseal not yet wired (fail-closed: secret delivery disabled until crypto API is integrated)".into()
-        ))
+        let key_bytes: [u8; 32] = node_private_key.as_slice().try_into().map_err(|_| {
+            AgentError::Secret(format!(
+                "node sealing key must be 32 bytes (X25519), got {}",
+                node_private_key.len()
+            ))
+        })?;
+        deliver_secret(&self.storage, sealed, &key_bytes)
     }
 
+    // 7.3.3: hardened delivery.
     async fn deliver(&self, spiffe_id: &str, plaintext: &[u8]) -> Result<(), AgentError> {
+        // Defense-in-depth: reject anything that isn't a well-formed SPIFFE ID
+        // before it touches the filesystem.
+        let _: SpiffeId = spiffe_id
+            .parse()
+            .map_err(|e| AgentError::Secret(format!("invalid SPIFFE ID for delivery: {}", e)))?;
+        // Sanitization is safe: every path separator ('/', ':') is replaced,
+        // so no traversal is possible after substitution.
         let safe_name = spiffe_id.replace(['/', ':'], "_");
         let path = std::path::PathBuf::from(format!("/run/fleetos/secrets/{safe_name}"));
         if let Some(parent) = path.parent() {
