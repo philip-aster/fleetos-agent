@@ -13,7 +13,7 @@
 //! and is covered by SDK verification points; this file tests orchestration.
 
 use fleetos_agent::error::AgentError;
-use fleetos_agent::workloads::workload_fingerprint;
+use fleetos_agent::wiring::{mark_all_pods_policy_enforced, reevaluate_router_connected};
 use fleetos_agent::workloads::{
     NetGuard, NodeIpAllocator, RuntimeKind, SrcIdentityRegistry, WorkloadManager, WorkloadSpec,
     containerd::ContainerdAdapter,
@@ -21,12 +21,12 @@ use fleetos_agent::workloads::{
     pod_manager::{Pod, PodManager, PodState},
     reconciler::Reconciler,
     volumes::{self, VolumeConfig},
+    workload_fingerprint,
 };
 use fleetos_core::hash::IdentityFingerprint;
-use fleetos_core::proto::fleetos::EmptyDir;
-use fleetos_core::proto::fleetos::HostPath;
-use fleetos_core::proto::fleetos::Volume;
 use fleetos_core::proto::fleetos::volume::Source;
+use fleetos_core::proto::fleetos::{EmptyDir, HostPath, Volume};
+use fleetos_core::proto::state::RouteEntry;
 use fleetos_core::proto::workload::{PodSpec, RestartPolicy, VolumeMount};
 use fleetos_core::spiffe::{IdKind, SpiffeId, WorkloadRole};
 use fleetos_ebpf_common::HostOrderIpv4;
@@ -121,6 +121,85 @@ impl SrcIdentityRegistry for MockSrcIdentityRegistry {
         self.unregistered.lock().unwrap().push(ip.0);
         Ok(())
     }
+}
+
+fn make_ready_pod(pod_id: &str, workload_id: &str, tenant_id: &str) -> Pod {
+    Pod::new(
+        pod_id.into(),
+        workload_id.into(),
+        tenant_id.into(),
+        "primary".into(),
+        RuntimeKind::CloudHypervisor,
+        IdentityFingerprint([7; 16]),
+    )
+}
+
+#[tokio::test]
+async fn route_update_sets_router_connected_for_covered_pods() {
+    let pm = Arc::new(tokio::sync::RwLock::new(PodManager::new()));
+    pm.write()
+        .await
+        .add_pod(make_ready_pod("web-pod", "web", "tenant-1"));
+    pm.write()
+        .await
+        .add_pod(make_ready_pod("db-pod", "db", "tenant-1"));
+
+    let routes = vec![RouteEntry {
+        destination_svid: "spiffe://test.internal/ns/tenant-1/sa/web".to_string(),
+        destination_role: "primary".to_string(),
+        target_agent_svid: "spiffe://test.internal/ns/system/node/node-1".to_string(),
+        dummy_ip: 0xF000_0001,
+    }];
+
+    reevaluate_router_connected(&pm, &routes, "test.internal").await;
+
+    let pm = pm.read().await;
+    assert!(
+        pm.get_pod("web-pod").unwrap().router_connected,
+        "covered pod must be connected"
+    );
+    assert!(
+        !pm.get_pod("db-pod").unwrap().router_connected,
+        "uncovered pod must be disconnected"
+    );
+}
+
+#[tokio::test]
+async fn route_removal_flips_router_connected_false() {
+    let pm = Arc::new(tokio::sync::RwLock::new(PodManager::new()));
+    pm.write()
+        .await
+        .add_pod(make_ready_pod("web-pod", "web", "tenant-1"));
+
+    let with_route = vec![RouteEntry {
+        destination_svid: "spiffe://test.internal/ns/tenant-1/sa/web".to_string(),
+        destination_role: "primary".to_string(),
+        target_agent_svid: "spiffe://test.internal/ns/system/node/node-1".to_string(),
+        dummy_ip: 0xF000_0001,
+    }];
+    reevaluate_router_connected(&pm, &with_route, "test.internal").await;
+    assert!(pm.read().await.get_pod("web-pod").unwrap().router_connected);
+
+    // Full-state update with the route removed flips it back to false.
+    reevaluate_router_connected(&pm, &[], "test.internal").await;
+    assert!(!pm.read().await.get_pod("web-pod").unwrap().router_connected);
+}
+
+#[tokio::test]
+async fn policy_sync_sets_policy_enforced_on_all_pods() {
+    let pm = Arc::new(tokio::sync::RwLock::new(PodManager::new()));
+    pm.write()
+        .await
+        .add_pod(make_ready_pod("web-pod", "web", "tenant-1"));
+    pm.write()
+        .await
+        .add_pod(make_ready_pod("db-pod", "db", "tenant-1"));
+
+    mark_all_pods_policy_enforced(&pm).await;
+
+    let pm = pm.read().await;
+    assert!(pm.get_pod("web-pod").unwrap().policy_enforced);
+    assert!(pm.get_pod("db-pod").unwrap().policy_enforced);
 }
 
 #[test]

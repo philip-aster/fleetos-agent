@@ -224,4 +224,9 @@ impl PodManager {
     pub fn is_empty(&self) -> bool {
         self.pods.is_empty()
     }
+
+    /// Get all pods mutably (Phase 7.4 readiness-gate re-evaluation).
+    pub fn all_pods_mut(&mut self) -> impl Iterator<Item = &mut Pod> {
+        self.pods.values_mut()
+    }
 }

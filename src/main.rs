@@ -287,6 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         control_client.clone(),
         ebpf_manager.clone(),
         config.node.trust_domain.clone(),
+        pod_manager.clone(),
     ));
     let schedule_handle = tokio::spawn(fleetos_agent::wiring::run_schedule_watch(
         control_client.clone(),
@@ -303,7 +304,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         containerd_adapter.clone(),
         ebpf_manager.clone(),
         config.node.trust_domain.clone(),
-        config.node.name.clone(), // Phase 7.2.4: thread node name
+        config.node.name.clone(),
+        pod_manager.clone(),
     ));
     tracing::info!("watch loops started: SAG, Schedule, Events, Routes");
 

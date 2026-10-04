@@ -2,7 +2,7 @@
 //! Phase 5 main wiring: watch loop runners connecting the control-plane streams
 //! to policy sync, workload reconcile, secret delivery, and route tables.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -25,12 +25,50 @@ use crate::routes::table::{
 use crate::secret::deliver::deliver_secret;
 use crate::storage::Storage;
 use crate::vsock_attest::config_push::WorkloadConfigBuilder;
+use crate::workloads::pod_manager::PodManager;
 use crate::workloads::{WorkloadManager, WorkloadSpec};
 use fleetos_core::proto::fleetos::watch_event::Event;
 use fleetos_core::proto::fleetos::{RouteEntry, SealedSecret};
 use fleetos_core::spiffe::{IdKind, SpiffeId};
 use fleetos_core::vsock_proto::DummyIpRouteConfig;
 use zeroize::Zeroizing;
+
+/// Phase 7.4.1 / 7.4.3: full re-evaluation of `router_connected`.
+///
+/// A pod is router-connected iff its workload SPIFFE ID appears as a route
+/// destination in the current full-state route set. Because every `RouteUpdate`
+/// is full state (Ruling B), re-evaluating against `routes` naturally sets
+/// `router_connected = true` for covered pods and flips it back to `false`
+/// for pods whose routes were removed.
+///
+/// v1 matches on SPIFFE ID only (tenant + workload); `RouteEntry` carries no
+/// source field, and per-role precision is a deferred refinement.
+pub async fn reevaluate_router_connected(
+    pod_manager: &RwLock<PodManager>,
+    routes: &[RouteEntry],
+    trust_domain: &str,
+) {
+    let dest_spiffes: HashSet<SpiffeId> = routes
+        .iter()
+        .filter_map(|r| r.destination_svid.parse::<SpiffeId>().ok())
+        .collect();
+    let mut pm = pod_manager.write().await;
+    for pod in pm.all_pods_mut() {
+        let pod_spiffe = SpiffeId::new(trust_domain, &pod.tenant_id, IdKind::Sa, &pod.workload_id);
+        pod.router_connected = dest_spiffes.contains(&pod_spiffe);
+    }
+}
+
+/// Phase 7.4.2: mark every pod `policy_enforced` after a successful policy sync.
+///
+/// v1 semantics: policy is cluster-wide and default-deny, so once eBPF policy
+/// is live it is enforced for all pods. Per-pod rule matching is deferred.
+pub async fn mark_all_pods_policy_enforced(pod_manager: &RwLock<PodManager>) {
+    let mut pm = pod_manager.write().await;
+    for pod in pm.all_pods_mut() {
+        pod.policy_enforced = true;
+    }
+}
 
 /// WatchSchedule → WorkloadManager reconcile.
 pub async fn run_schedule_watch(
@@ -65,6 +103,7 @@ pub async fn run_routes_watch(
     ebpf_manager: Arc<std::sync::Mutex<EbpfManager>>,
     trust_domain: String,
     node_name: String,
+    pod_manager: Arc<RwLock<PodManager>>,
 ) {
     // Phase 7.2.4: Construct the agent's own node SpiffeId.
     let own_node_spiffe_id = SpiffeId::new(&trust_domain, "system", IdKind::Node, &node_name);
@@ -127,6 +166,9 @@ pub async fn run_routes_watch(
                             &mutations,
                             update.version,
                         );
+                        // Phase 7.4.1 / 7.4.3: full re-evaluation of router_connected.
+                        reevaluate_router_connected(&pod_manager, &update.routes, &trust_domain)
+                            .await;
                         tracing::info!(
                             version = update.version,
                             routes = update.routes.len(),
@@ -164,6 +206,7 @@ pub async fn run_sag_watch(
     control_client: Arc<ControlPlaneClient>,
     ebpf_manager: Arc<std::sync::Mutex<EbpfManager>>,
     data_trust_domain: String,
+    pod_manager: Arc<RwLock<PodManager>>,
 ) {
     // Phase 7.1.2: Own a PolicySyncState instance, initialized empty, version 0.
     let mut sync_state = PolicySyncState::new();
@@ -178,6 +221,8 @@ pub async fn run_sag_watch(
                 {
                     tracing::warn!(error = %e, "policy sync failed");
                 } else {
+                    // Phase 7.4.2: policy is live → mark all pods policy_enforced.
+                    mark_all_pods_policy_enforced(&pod_manager).await;
                     tracing::debug!(
                         version = update.version,
                         rules = update.rules.len(),
