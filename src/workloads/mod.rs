@@ -6,6 +6,7 @@
 
 pub mod containerd;
 pub mod env;
+pub mod image;
 pub mod lifecycle;
 pub mod microvm;
 pub mod pod_manager;
@@ -126,6 +127,8 @@ pub struct WorkloadManager {
     /// Live MicroVM adapters keyed by vsock_cid.
     microvms: Arc<RwLock<HashMap<u32, Arc<MicroVmAdapter>>>>,
     trust_domain: String,
+    /// Path to the erofs image cache directory (Phase 7.7.3).
+    image_cache_path: std::path::PathBuf,
     /// Source-identity registry (SRC_IDENTITY_MAP), injected (7.2.5).
     src_identity: Option<Arc<dyn SrcIdentityRegistry>>,
     /// Node-local workload IP allocator (7.2.5 / Option B).
@@ -148,6 +151,7 @@ impl WorkloadManager {
         trust_domain: String,
         src_identity: Option<Arc<dyn SrcIdentityRegistry>>,
         ip_allocator: Arc<StdMutex<NodeIpAllocator>>,
+        image_cache_path: std::path::PathBuf,
     ) -> Self {
         Self {
             containerd,
@@ -157,6 +161,7 @@ impl WorkloadManager {
             net_guard,
             microvms: Arc::new(RwLock::new(HashMap::new())),
             trust_domain,
+            image_cache_path,
             src_identity,
             ip_allocator,
             pod_source_ips: Arc::new(StdMutex::new(HashMap::new())),
@@ -339,7 +344,6 @@ impl WorkloadManager {
     ) -> Result<u32, AgentError> {
         // Allocate a VSOCK CID for this MicroVM.
         let vsock_cid = self.cid_allocator.write().await.allocate();
-
         // BOOT-RACE GUARD (non-negotiable): arm BEFORE the VM boots / TAP comes up.
         // Fail-closed: if there is no guard or arming fails, abort the boot.
         let interface = format!("vmtap{}", vsock_cid);
@@ -347,17 +351,22 @@ impl WorkloadManager {
             Some(guard) => guard.arm(&interface)?,
             None => {
                 return Err(AgentError::Workload(
-                    "boot aborted: NetGuard (VmNetGuard) not armed before MicroVM boot (fail-closed)".into(),
-                ));
+                       "boot aborted: NetGuard (VmNetGuard) not armed before MicroVM boot (fail-closed)".into(),
+                   ));
             }
         }
-
         // Create + boot the MicroVM adapter.
         let api_socket = format!("/run/fleetos/vm/{}/api.sock", vsock_cid);
         let adapter = Arc::new(MicroVmAdapter::new(&api_socket)?);
-        let rootfs_path = format!("/var/lib/fleetos/images/{}.erofs", spec.image);
-        let handle = adapter.boot(spec, vsock_cid, mounts, &rootfs_path).await?;
 
+        // Phase 7.7.3: Resolve OCI image to erofs rootfs path.
+        let rootfs_path =
+            crate::workloads::image::oci_to_erofs(&spec.image, &self.image_cache_path)?;
+        let rootfs_path_str = rootfs_path.to_string_lossy().to_string();
+
+        let handle = adapter
+            .boot(spec, vsock_cid, mounts, &rootfs_path_str)
+            .await?;
         self.microvms.write().await.insert(vsock_cid, adapter);
         Ok(handle)
     }

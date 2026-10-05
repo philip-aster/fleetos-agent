@@ -248,6 +248,7 @@ async fn boot_pod_requests_and_installs_delegated_key() {
         "test.internal".to_string(),
         None, // no SrcIdentityRegistry
         ip_alloc,
+        tempdir.path().join("images"),
     )
     .with_delegation(client, delegated_keys.clone(), node_spiffe, 14400);
 
@@ -343,6 +344,7 @@ fn make_manager_parts(
         "test.internal".to_string(),
         None,
         ip_allocator,
+        tempdir.path().join("images"),
     );
     (wm, pod_manager)
 }
@@ -620,6 +622,7 @@ async fn boot_microvm_registers_src_identity_and_cleans_up_on_failure() {
         "test.internal".to_string(),
         Some(registry.clone()),
         ip_alloc.clone(),
+        tempdir.path().join("images"),
     );
     let spec = make_spec("web", RuntimeKind::CloudHypervisor);
     wm.reconcile(&[spec]).await.unwrap(); // boot fails (no CH); reconcile swallows
@@ -812,6 +815,39 @@ async fn undefined_volume_reference_rejected() {
         result.is_err(),
         "undefined volume reference must be rejected fail-closed"
     );
+}
+
+// =========================================================================
+// Image conversion (Phase 7.7.7)
+// =========================================================================
+#[test]
+fn oci_to_erofs_sanitizes_image_names() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let cache_dir = tempdir.path().join("images");
+
+    // Standard image reference
+    let path1 =
+        fleetos_agent::workloads::image::oci_to_erofs("docker.io/library/nginx:latest", &cache_dir)
+            .unwrap();
+    assert_eq!(
+        path1.file_name().unwrap().to_str().unwrap(),
+        "docker.io_library_nginx_latest.erofs"
+    );
+
+    // Image with digest
+    let path2 = fleetos_agent::workloads::image::oci_to_erofs(
+        "ghcr.io/fleetos/db@sha256:abcdef1234567890",
+        &cache_dir,
+    )
+    .unwrap();
+    assert_eq!(
+        path2.file_name().unwrap().to_str().unwrap(),
+        "ghcr.io_fleetos_db_sha256_abcdef1234567890.erofs"
+    );
+
+    // All paths should be under the cache directory
+    assert!(path1.starts_with(&cache_dir));
+    assert!(path2.starts_with(&cache_dir));
 }
 
 // =========================================================================

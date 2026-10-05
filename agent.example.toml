@@ -88,3 +88,10 @@ port = 18001  # 0x4649
 # Node-local CIDR for MicroVM workload source IPs (SRC_IDENTITY_MAP keying).
 # Must not overlap 240.0.0.0/4. Agent-local only; not globally routable.
 workload_ip_cidr = "172.30.0.0/16"
+
+# ---------------------------------------------------------------------------
+# observability
+# ---------------------------------------------------------------------------
+[observability]
+otlp_endpoint = "http://otel-collector:4317"
+push_interval_secs = 5

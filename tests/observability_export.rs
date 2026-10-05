@@ -253,3 +253,47 @@ async fn pod_events_auto_flush_when_batch_full() {
     assert_eq!(received[0].events[0].event_type, event_types::CREATED);
     assert_eq!(received[0].events[1].event_type, event_types::STARTED);
 }
+
+// ---------------------------------------------------------------------------
+// OTLP smoke test (gated, requires a running OTLP collector)
+// ---------------------------------------------------------------------------
+#[test]
+fn otlp_flow_exporter_smoke() {
+    // Gated behind FLEETOS_OTLP_TESTS=1 and requires a running OTLP collector.
+    if std::env::var("FLEETOS_OTLP_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping OTLP smoke test: set FLEETOS_OTLP_TESTS=1 to run");
+        return;
+    }
+
+    let endpoint = std::env::var("FLEETOS_OTLP_ENDPOINT")
+        .unwrap_or_else(|_| "http://localhost:4317".to_string());
+
+    let exporter = fleetos_agent::observability::flow_events::FlowOtlpExporter::new(&endpoint)
+        .expect("OTLP exporter init failed");
+
+    let records = vec![
+        fleetos_agent::observability::flow_events::OtlpFlowRecord {
+            src_fingerprint: [0x11; 16],
+            dst_fingerprint: [0x22; 16],
+            port: 8080,
+            action: 1,
+            direction: 0,
+            timestamp_unix: 1234567890,
+        },
+        fleetos_agent::observability::flow_events::OtlpFlowRecord {
+            src_fingerprint: [0x33; 16],
+            dst_fingerprint: [0x44; 16],
+            port: 443,
+            action: 0,
+            direction: 1,
+            timestamp_unix: 1234567891,
+        },
+    ];
+
+    exporter.export(&records).expect("OTLP export failed");
+    eprintln!(
+        "OTLP smoke test: exported {} records to {}",
+        records.len(),
+        endpoint
+    );
+}

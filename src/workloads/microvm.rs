@@ -61,6 +61,7 @@ impl MicroVmAdapter {
     ///
     /// PRECONDITION: WorkloadManager has already armed VmNetGuard. This method
     /// builds the CH config, defines the VM, and boots it. Fail-closed on error.
+    // ...
     pub async fn boot(
         &self,
         spec: &WorkloadSpec,
@@ -72,30 +73,53 @@ impl MicroVmAdapter {
             .pod_spec
             .as_ref()
             .ok_or_else(|| AgentError::Workload("microvm boot requires full PodSpec".into()))?;
-
         let (vcpus, mem_mb) = match pod_spec.resources.as_ref() {
             Some(r) => (r.vcpus as u8, r.memory_mb as u64),
             None => (1, 512),
         };
-
         // Build the CH VM config (kernel, erofs rootfs disk, vsock, net).
-        // SDK VERIFICATION POINT: VmConfig / boot / device model shapes.
-        use cloud_hypervisor_client::models::{DiskConfig, VmConfig, VsockConfig};
+        // SDK VERIFICATION POINT: VmConfig field names verified against cloud-hypervisor
+        // OpenAPI spec 0.3.0 (cpus, memory, payload, disks, vsock).
+        use cloud_hypervisor_client::models::{
+            CpusConfig, DiskConfig, MemoryConfig, PayloadConfig, VmConfig, VsockConfig,
+        };
 
-        let _disk = DiskConfig {
+        let cpus = CpusConfig {
+            boot_vcpus: vcpus as i32,
+            max_vcpus: vcpus as i32,
+            ..Default::default()
+        };
+
+        let memory = MemoryConfig {
+            size: (mem_mb * 1024 * 1024) as i64,
+            ..Default::default()
+        };
+
+        // TODO(7.7.6): kernel_path should come from AgentConfig.vsock_attest.kernel_path
+        let payload = PayloadConfig {
+            kernel: Some("/var/lib/fleetos/vmlinux".to_string()),
+            ..Default::default()
+        };
+
+        let disk = DiskConfig {
             path: Some(rootfs_path.to_string()),
             readonly: Some(true), // erofs rootfs is read-only
             ..Default::default()
         };
 
-        let _vsock = VsockConfig {
+        // VsockConfig.socket is for host-initiated connections; we use guest-initiated
+        // to HOST_CID (2), so we leave socket empty and just assign the guest CID.
+        let vsock = VsockConfig {
             cid: vsock_cid as i64,
-            socket: self.api_socket.clone(),
             ..Default::default()
         };
 
         let vm_config = VmConfig {
-            // SDK VERIFICATION POINT: field names (cpus/memory/disks/vsock/net).
+            cpus: Some(cpus),
+            memory: Some(memory),
+            payload,
+            disks: Some(vec![disk]),
+            vsock: Some(vsock),
             ..Default::default()
         };
 

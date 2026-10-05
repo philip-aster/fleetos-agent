@@ -80,6 +80,11 @@ libc = "0.2.189"
 containerd-client = "0.9.0"
 cloud-hypervisor-client = "0.6.0"
 
+# --- Observability ---
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic", "logs"] }
+
 [dev-dependencies]
 hex = "0.4.3"
 tempfile = "3.27.0"

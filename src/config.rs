@@ -32,9 +32,57 @@ pub struct AgentConfig {
     /// VSOCK attestation server configuration (for MicroVM guest attestation).
     #[serde(default)]
     pub vsock_attest: VsockAttestConfig,
+    /// Image management configuration (Phase 7.7.6).
+    #[serde(default)]
+    pub images: ImagesConfig,
     /// Networking configuration.
     #[serde(default)]
     pub networking: NetworkingConfig,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImagesConfig {
+    /// Directory where erofs rootfs images are cached.
+    #[serde(default = "default_image_cache_path")]
+    pub cache_path: PathBuf,
+}
+
+fn default_image_cache_path() -> PathBuf {
+    PathBuf::from("/var/lib/fleetos/images")
+}
+
+impl Default for ImagesConfig {
+    fn default() -> Self {
+        Self {
+            cache_path: default_image_cache_path(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ObservabilityConfig {
+    /// OTLP gRPC endpoint for pushing flow events (e.g., "http://otel-collector:4317").
+    /// Empty string means OTLP export is disabled.
+    #[serde(default)]
+    pub otlp_endpoint: String,
+    /// Interval in seconds between flow event drain/push cycles.
+    #[serde(default = "default_observability_push_interval_secs")]
+    pub push_interval_secs: u64,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: String::new(),
+            push_interval_secs: default_observability_push_interval_secs(),
+        }
+    }
+}
+
+fn default_observability_push_interval_secs() -> u64 {
+    5
 }
 
 #[derive(Debug, Clone, Deserialize)]

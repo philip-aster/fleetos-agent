@@ -19,7 +19,6 @@ use fleetos_agent::ebpf::EbpfManager;
 use fleetos_agent::identity::keystore::TpmSealedStore;
 use fleetos_agent::identity::svid;
 use fleetos_agent::join;
-use fleetos_agent::observability::flow_events::FlowEventsDrainLoop;
 use fleetos_agent::observability::pod_events::PodEventReporter;
 use fleetos_agent::storage::Storage;
 use fleetos_agent::vsock_attest::VsockAttestServer;
@@ -215,6 +214,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.node.trust_domain.clone(),
             src_identity,
             ip_allocator,
+            config.images.cache_path.clone(),
         )
         .with_delegation(
             control_client.clone(),
@@ -260,7 +260,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("status reporter started");
 
     // --- Phase 10: Observability ---
-    let flow_drain = FlowEventsDrainLoop::new(flow_events_ring_buf, Duration::from_secs(5));
+    // Create the OTLP flow exporter (if configured).
+    let flow_exporter = if config.observability.otlp_endpoint.is_empty() {
+        tracing::info!("OTLP export disabled (no endpoint configured)");
+        None
+    } else {
+        match fleetos_agent::observability::flow_events::FlowOtlpExporter::new(
+            &config.observability.otlp_endpoint,
+        ) {
+            Ok(exporter) => {
+                tracing::info!(
+                    endpoint = %config.observability.otlp_endpoint,
+                    "OTLP flow exporter initialized"
+                );
+                Some(exporter)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to initialize OTLP exporter, flow events will be dropped"
+                );
+                None
+            }
+        }
+    };
+
+    let flow_drain = fleetos_agent::observability::flow_events::FlowEventsDrainLoop::new(
+        flow_events_ring_buf,
+        std::time::Duration::from_secs(config.observability.push_interval_secs),
+        flow_exporter,
+    );
     let flow_shutdown_rx = shutdown_rx.clone();
     let flow_handle = tokio::spawn(async move {
         if let Err(e) = flow_drain.run_drain_loop(flow_shutdown_rx).await {
