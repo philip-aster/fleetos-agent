@@ -143,6 +143,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _channel = control_client.get_channel().await?;
     tracing::info!("mTLS channel established to control plane");
 
+    // --- Phase 6b: Delegated signing key manager (7.5) ---
+    // Map-based: one delegated renewal key per hosted workload SPIFFE ID.
+    let delegated_keys = std::sync::Arc::new(std::sync::RwLock::new(
+        fleetos_agent::identity::degraded::DelegatedKeyManager::new(),
+    ));
+    let node_spiffe_id = fleetos_core::spiffe::SpiffeId::new(
+        &config.node.trust_domain,
+        "system",
+        fleetos_core::spiffe::IdKind::Node,
+        &config.node.name,
+    );
+    tracing::info!("delegated key manager initialized");
+
     // --- Phase 6: eBPF ---
     let mut ebpf_manager = EbpfManager::load(&config.ebpf)?;
     tracing::info!(
@@ -193,15 +206,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fleetos_agent::workloads::NodeIpAllocator::new(&config.networking.workload_ip_cidr)?,
     ));
 
-    let workload_manager = std::sync::Arc::new(fleetos_agent::workloads::WorkloadManager::new(
-        containerd_adapter.clone(),
-        volume_config,
-        pod_manager.clone(),
-        net_guard,
-        config.node.trust_domain.clone(),
-        src_identity,
-        ip_allocator,
-    ));
+    let workload_manager = std::sync::Arc::new(
+        fleetos_agent::workloads::WorkloadManager::new(
+            containerd_adapter.clone(),
+            volume_config,
+            pod_manager.clone(),
+            net_guard,
+            config.node.trust_domain.clone(),
+            src_identity,
+            ip_allocator,
+        )
+        .with_delegation(
+            control_client.clone(),
+            delegated_keys.clone(),
+            node_spiffe_id.clone(),
+            config.svid.delegated_key_ttl_secs,
+        ),
+    );
 
     let secrets_handler = std::sync::Arc::new(fleetos_agent::wiring::SecretsHandler::new(
         control_client.clone(),
@@ -212,7 +233,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Phase 8: VSOCK attestation server ---
     let verifier = Arc::new(VsockQuoteVerifier::new());
-    let config_builder = Arc::new(WorkloadConfigBuilder::new(config.node.trust_domain.clone()));
+    let config_builder = Arc::new(WorkloadConfigBuilder::new(
+        config.node.trust_domain.clone(),
+        delegated_keys.clone(),
+        config.svid.workload_ttl_secs,
+    ));
     let vsock_server = VsockAttestServer::new(verifier, config_builder.clone());
     let vsock_shutdown_rx = shutdown_rx.clone();
     let vsock_handle = tokio::spawn(async move {
@@ -262,6 +287,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     tracing::info!("pod event reporter started");
+
+    // --- 7.5.5: Delegated key refresh loop (75% TTL) ---
+    let delegation_shutdown_rx = shutdown_tx.subscribe();
+    let delegation_client = control_client.clone();
+    let delegation_manager = delegated_keys.clone();
+    let delegation_node_id = node_spiffe_id.clone();
+    let delegation_ttl = config.svid.delegated_key_ttl_secs;
+    tokio::spawn(async move {
+        fleetos_agent::identity::degraded::run_delegation_refresh_loop(
+            delegation_client,
+            delegation_manager,
+            delegation_node_id,
+            delegation_ttl,
+            std::time::Duration::from_secs(60),
+            delegation_shutdown_rx,
+        )
+        .await;
+    });
+    tracing::info!("delegated key refresh loop started (75% TTL)");
 
     // --- Phase 11: Counters reporter ---
     let counters_client = control_client.workload_status_client().await?;

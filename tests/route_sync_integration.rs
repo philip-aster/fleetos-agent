@@ -30,6 +30,7 @@ fn make_route(
         destination_role: dest_role.to_string(),
         target_agent_svid: target_agent.to_string(),
         dummy_ip,
+        source_spiffe_ids: vec![],
     }
 }
 

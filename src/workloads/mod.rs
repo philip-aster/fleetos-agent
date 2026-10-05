@@ -132,6 +132,11 @@ pub struct WorkloadManager {
     ip_allocator: Arc<StdMutex<NodeIpAllocator>>,
     /// Allocated source IPs per pod (pod_id -> host-order IP), for release on stop.
     pod_source_ips: Arc<StdMutex<HashMap<String, u32>>>,
+    // Delegated signing dependencies (optional; set via with_delegation).
+    control_client: Option<Arc<crate::client::ControlPlaneClient>>,
+    delegated_keys: Option<Arc<std::sync::RwLock<crate::identity::degraded::DelegatedKeyManager>>>,
+    node_spiffe_id: Option<SpiffeId>,
+    delegated_key_ttl_secs: u64,
 }
 
 impl WorkloadManager {
@@ -155,6 +160,10 @@ impl WorkloadManager {
             src_identity,
             ip_allocator,
             pod_source_ips: Arc::new(StdMutex::new(HashMap::new())),
+            control_client: None,
+            delegated_keys: None,
+            node_spiffe_id: None,
+            delegated_key_ttl_secs: crate::identity::degraded::DEFAULT_DELEGATED_KEY_TTL_SECS,
         }
     }
 
@@ -182,22 +191,41 @@ impl WorkloadManager {
         Ok(())
     }
 
+    /// Attach the delegated-signing dependencies (7.5). Optional; without
+    /// these, workload SVIDs are left empty (fail-closed) at config push.
+    pub fn with_delegation(
+        mut self,
+        control_client: Arc<crate::client::ControlPlaneClient>,
+        delegated_keys: Arc<std::sync::RwLock<crate::identity::degraded::DelegatedKeyManager>>,
+        node_spiffe_id: SpiffeId,
+        delegated_key_ttl_secs: u64,
+    ) -> Self {
+        self.control_client = Some(control_client);
+        self.delegated_keys = Some(delegated_keys);
+        self.node_spiffe_id = Some(node_spiffe_id);
+        self.delegated_key_ttl_secs = delegated_key_ttl_secs;
+        self
+    }
+
     /// Boot a single pod on the correct runtime adapter.
     async fn boot_pod(&self, spec: &WorkloadSpec) -> Result<u32, AgentError> {
         let pod_spec = spec
             .pod_spec
             .as_ref()
             .ok_or_else(|| AgentError::Workload("boot requires full PodSpec".into()))?;
+
         let pod_id = pod_spec
             .pod_id
             .clone()
             .unwrap_or_else(|| spec.workload_id.clone());
+
         let mounts = volumes::prepare_mounts(
             &self.volume_config,
             &pod_id,
             &pod_spec.volumes,
             &pod_spec.volume_mounts,
         )?;
+
         // 7.6.1: real fingerprint from the workload's SPIFFE identity + role.
         let fp = workload_fingerprint(
             &self.trust_domain,
@@ -205,6 +233,40 @@ impl WorkloadManager {
             &spec.workload_id,
             &spec.role,
         )?;
+
+        // 7.5.1: request a delegated signing key for this workload so its SVID
+        // can be generated at config push (and later renewed in degraded mode).
+        // Awaited so the key is installed before the guest connects for config
+        // push; a failure is non-fatal (config push fails closed with an empty SVID).
+        if let (Some(client), Some(keys), Some(node_id)) = (
+            &self.control_client,
+            &self.delegated_keys,
+            &self.node_spiffe_id,
+        ) {
+            let workload_spiffe_id = SpiffeId::new(
+                &self.trust_domain,
+                &pod_spec.tenant_id,
+                IdKind::Sa,
+                &spec.workload_id,
+            );
+            if let Err(e) = crate::identity::degraded::request_and_install(
+                client,
+                keys,
+                node_id,
+                &workload_spiffe_id,
+                pod_spec.ordinal,
+                self.delegated_key_ttl_secs,
+            )
+            .await
+            {
+                tracing::warn!(
+                    target = %workload_spiffe_id,
+                    error = %e,
+                    "delegated key request failed at boot; workload SVID will be empty (fail-closed)"
+                );
+            }
+        }
+
         // 7.2.5 (Option B): MicroVM gets an agent-assigned node-local source IP,
         // registered in SRC_IDENTITY_MAP before boot so the guest's first packet
         // is attributable (fail-closed otherwise). Containerd IP discovery is a
@@ -222,10 +284,12 @@ impl WorkloadManager {
                 // TODO(7.7): feed src_ip into WorkloadContext.guest_ip for guest-init.
             }
         }
+
         let boot_result = match spec.runtime {
             RuntimeKind::Containerd => self.boot_containerd(spec, &mounts).await,
             RuntimeKind::CloudHypervisor => self.boot_microvm(spec, &mounts).await,
         };
+
         let handle = match boot_result {
             Ok(h) => h,
             Err(e) => {
@@ -237,6 +301,7 @@ impl WorkloadManager {
                 return Err(e);
             }
         };
+
         let mut pod = Pod::new(
             pod_id.clone(),
             spec.workload_id.clone(),
@@ -245,8 +310,10 @@ impl WorkloadManager {
             spec.runtime,
             fp,
         );
+
         pod.state = PodState::Booting;
         pod.pid = Some(handle);
+        pod.mark_started();
         if let Some(ho) = registered_ip {
             self.pod_source_ips
                 .lock()

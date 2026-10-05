@@ -233,12 +233,29 @@ impl Default for EbpfConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SvidConfig {
-    /// SVID TTL in seconds.
+    /// Node SVID TTL in seconds.
     #[serde(default = "default_svid_ttl_secs")]
     pub ttl_secs: u64,
     /// Fraction of TTL at which refresh is triggered. Default 0.75 (75%).
     #[serde(default = "default_refresh_fraction")]
     pub refresh_fraction: f64,
+    /// Workload SVID TTL in seconds (SVIDs the agent mints for workloads).
+    /// Default 3600 (1 hour), matching control's workload_ttl_secs.
+    #[serde(default = "default_workload_ttl_secs")]
+    pub workload_ttl_secs: u64,
+    /// Delegated signing key TTL in seconds (keys requested from control).
+    /// Default 14400 (4 hours), matching control's delegated_key_ttl_secs
+    /// and identity::degraded::DEFAULT_DELEGATED_KEY_TTL_SECS.
+    #[serde(default = "default_delegated_key_ttl_secs")]
+    pub delegated_key_ttl_secs: u64,
+}
+
+fn default_workload_ttl_secs() -> u64 {
+    3600
+}
+
+fn default_delegated_key_ttl_secs() -> u64 {
+    14400
 }
 
 fn default_svid_ttl_secs() -> u64 {
@@ -254,6 +271,8 @@ impl Default for SvidConfig {
         Self {
             ttl_secs: default_svid_ttl_secs(),
             refresh_fraction: default_refresh_fraction(),
+            workload_ttl_secs: default_workload_ttl_secs(),
+            delegated_key_ttl_secs: default_delegated_key_ttl_secs(),
         }
     }
 }

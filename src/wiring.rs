@@ -2,7 +2,7 @@
 //! Phase 5 main wiring: watch loop runners connecting the control-plane streams
 //! to policy sync, workload reconcile, secret delivery, and route tables.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -33,29 +33,49 @@ use fleetos_core::spiffe::{IdKind, SpiffeId};
 use fleetos_core::vsock_proto::DummyIpRouteConfig;
 use zeroize::Zeroizing;
 
-/// Phase 7.4.1 / 7.4.3: full re-evaluation of `router_connected`.
+/// Phase 7.4.1 / 7.4.3 (CORE-WI-5): full re-evaluation of `router_connected`.
 ///
-/// A pod is router-connected iff its workload SPIFFE ID appears as a route
-/// destination in the current full-state route set. Because every `RouteUpdate`
-/// is full state (Ruling B), re-evaluating against `routes` naturally sets
-/// `router_connected = true` for covered pods and flips it back to `false`
-/// for pods whose routes were removed.
+/// Semantics: a pod is router-connected iff all of its outbound dependencies
+/// are routed. A pod's dependencies are the routes where it appears as a
+/// source (i.e., in `RouteEntry.source_spiffe_ids` — computed by control from
+/// SAG rules; we do NOT recompute source sets locally).
 ///
-/// v1 matches on SPIFFE ID only (tenant + workload); `RouteEntry` carries no
-/// source field, and per-role precision is a deferred refinement.
+/// Full re-evaluation per `RouteUpdate` (Ruling B: full state every frame):
+/// - Pod appears in no `source_spiffe_ids` → no outbound dependencies →
+///   trivially connected (nothing to depend on).
+/// - Pod appears in one or more `source_spiffe_ids` → connected iff every
+///   such route is actually routed, i.e. `dummy_ip != 0`. Control signals
+///   an unrouted target with the `dummy_ip = 0` sentinel (proto: "0 = none"),
+///   so a pod with unrouted dependencies still appears in some
+///   `source_spiffe_ids` entry with `dummy_ip = 0` and is correctly marked
+///   disconnected until the route lands.
+///
+/// This replaces the old destination-based check, which was the CORE-WI-5 bug:
+/// it marked server-only pods connected trivially and left pure-client pods
+/// stuck disconnected forever.
 pub async fn reevaluate_router_connected(
     pod_manager: &RwLock<PodManager>,
     routes: &[RouteEntry],
     trust_domain: &str,
 ) {
-    let dest_spiffes: HashSet<SpiffeId> = routes
-        .iter()
-        .filter_map(|r| r.destination_svid.parse::<SpiffeId>().ok())
-        .collect();
     let mut pm = pod_manager.write().await;
     for pod in pm.all_pods_mut() {
         let pod_spiffe = SpiffeId::new(trust_domain, &pod.tenant_id, IdKind::Sa, &pod.workload_id);
-        pod.router_connected = dest_spiffes.contains(&pod_spiffe);
+        let pod_spiffe_str = pod_spiffe.to_string();
+
+        // Routes this pod depends on = routes where it appears as a source.
+        let my_routes: Vec<&RouteEntry> = routes
+            .iter()
+            .filter(|r| r.source_spiffe_ids.iter().any(|s| *s == pod_spiffe_str))
+            .collect();
+
+        pod.router_connected = if my_routes.is_empty() {
+            // No outbound dependencies -> trivially connected.
+            true
+        } else {
+            // Connected iff every dependency is routed (dummy_ip != 0 sentinel).
+            my_routes.iter().all(|r| r.dummy_ip != 0)
+        };
     }
 }
 

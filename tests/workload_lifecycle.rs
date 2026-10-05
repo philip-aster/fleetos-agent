@@ -12,7 +12,13 @@
 //! Actual containerd/Cloud Hypervisor boot execution requires real runtimes
 //! and is covered by SDK verification points; this file tests orchestration.
 
+mod common;
+use fleetos_agent::client::ControlPlaneClient;
 use fleetos_agent::error::AgentError;
+use fleetos_agent::identity::degraded::DelegatedKeyManager;
+use fleetos_agent::identity::keystore::{SensitiveStore, TpmSealedStore};
+use fleetos_agent::identity::svid::SvidState;
+use fleetos_agent::storage::Storage;
 use fleetos_agent::wiring::{mark_all_pods_policy_enforced, reevaluate_router_connected};
 use fleetos_agent::workloads::{
     NetGuard, NodeIpAllocator, RuntimeKind, SrcIdentityRegistry, WorkloadManager, WorkloadSpec,
@@ -25,12 +31,20 @@ use fleetos_agent::workloads::{
 };
 use fleetos_core::hash::IdentityFingerprint;
 use fleetos_core::proto::fleetos::volume::Source;
+use fleetos_core::proto::fleetos::{
+    DelegatedKeyRequest, DelegatedKeyResponse,
+    delegation_service_server::{DelegationService, DelegationServiceServer},
+};
 use fleetos_core::proto::fleetos::{EmptyDir, HostPath, Volume};
 use fleetos_core::proto::state::RouteEntry;
 use fleetos_core::proto::workload::{PodSpec, RestartPolicy, VolumeMount};
 use fleetos_core::spiffe::{IdKind, SpiffeId, WorkloadRole};
 use fleetos_ebpf_common::HostOrderIpv4;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::{Request, Response, Status};
 
 // --- Mock NetGuard: records arm() calls, optionally fails arm ---
 struct MockNetGuard {
@@ -59,6 +73,232 @@ impl NetGuard for MockNetGuard {
     fn disarm(&self, _interface: &str) -> Result<(), AgentError> {
         Ok(())
     }
+}
+
+// =========================================================================
+// Boot-path delegation (Phase 7.5) — mock ControlPlaneClient integration
+// =========================================================================
+//
+// Verifies that boot_pod requests and installs a delegated signing key via
+// the real request_and_install path against a mock DelegationService. Boot
+// itself fails (no runtime), but the delegation request completes first.
+
+/// Serializable mirror of DelegatedSigningKeyWire (which is Deserialize-only).
+/// Field order must match exactly — postcard is positional.
+#[derive(serde::Serialize)]
+struct DelegationKeyWire {
+    node_id: SpiffeId,
+    target_svid_id: SpiffeId,
+    target_ordinal: Option<u32>,
+    issued_at_unix: u64,
+    expires_at_unix: u64,
+    signing_key: Vec<u8>,
+    intermediate_cert_der: Vec<u8>,
+    target_role: Option<WorkloadRole>,
+}
+
+/// Build a valid postcard-encoded DelegatedSigningKey for the given target.
+fn build_key_material(target: &SpiffeId, role: &str, ordinal: Option<u32>) -> Vec<u8> {
+    let int_key = rcgen::KeyPair::generate().unwrap();
+    let mut int_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    let mut dn = rcgen::DistinguishedName::new();
+    dn.push(rcgen::DnType::CommonName, "Test Delegated Intermediate");
+    int_params.distinguished_name = dn;
+    int_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+    int_params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    let int_cert = int_params.self_signed(&int_key).unwrap();
+    let now = fleetos_agent::identity::degraded::now_unix();
+    let wire = DelegationKeyWire {
+        node_id: "spiffe://test.internal/ns/system/node/agent-1"
+            .parse()
+            .unwrap(),
+        target_svid_id: target.clone(),
+        target_ordinal: ordinal,
+        issued_at_unix: now,
+        expires_at_unix: now + 14400,
+        signing_key: int_key.serialize_der(),
+        intermediate_cert_der: int_cert.der().to_vec(),
+        target_role: Some(WorkloadRole::try_from(role).unwrap()),
+    };
+    postcard::to_allocvec(&wire).unwrap()
+}
+
+/// Mock DelegationService: captures the request, returns a valid key.
+struct MockDelegationService {
+    key_material: Vec<u8>,
+    last_request: std::sync::Mutex<Option<DelegatedKeyRequest>>,
+    call_count: AtomicUsize,
+}
+
+#[tonic::async_trait]
+impl DelegationService for MockDelegationService {
+    async fn request_delegated_key(
+        &self,
+        request: Request<DelegatedKeyRequest>,
+    ) -> Result<Response<DelegatedKeyResponse>, Status> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        *self.last_request.lock().unwrap() = Some(request.into_inner());
+        Ok(Response::new(DelegatedKeyResponse {
+            delegation_id: b"test-delegation-id".to_vec(),
+            key_material: self.key_material.clone(),
+            expires_at_unix: fleetos_agent::identity::degraded::now_unix() + 14400,
+        }))
+    }
+}
+
+/// Spawn a mock DelegationService behind TLS. Returns (address, service handle).
+async fn spawn_delegation_server(
+    key_material: Vec<u8>,
+    server_cert_pem: &str,
+    server_key_pem: &str,
+) -> (String, Arc<MockDelegationService>) {
+    let identity = Identity::from_pem(server_cert_pem, server_key_pem);
+    let tls = ServerTlsConfig::new().identity(identity);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = TcpListenerStream::new(listener);
+    let service = Arc::new(MockDelegationService {
+        key_material,
+        last_request: std::sync::Mutex::new(None),
+        call_count: AtomicUsize::new(0),
+    });
+    let svc = service.clone();
+    tokio::spawn(async move {
+        Server::builder()
+            .tls_config(tls)
+            .expect("mock TLS config")
+            .add_service(DelegationServiceServer::from_arc(svc))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr.to_string(), service)
+}
+
+#[tokio::test]
+async fn boot_pod_requests_and_installs_delegated_key() {
+    // FIX: Install the rustls crypto provider before any TLS operations
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // --- TLS material (same pattern as secret_fetch_retry.rs) ---
+    let ca = common::certs::TestCa::generate().unwrap();
+    let (server_cert_pem, server_key_pem) = ca.server_identity().unwrap();
+    let ca_pem = ca.cert_pem();
+
+    // The workload we'll boot.
+    let spec = make_spec("web", RuntimeKind::CloudHypervisor);
+    let expected_target: SpiffeId = "spiffe://test.internal/ns/tenant-1/sa/web".parse().unwrap();
+
+    // Build valid key material for this target.
+    let key_material = build_key_material(&expected_target, "primary", None);
+
+    // Spawn mock DelegationService.
+    let (addr, mock_svc) =
+        spawn_delegation_server(key_material, &server_cert_pem, &server_key_pem).await;
+
+    // --- ControlPlaneClient with a dummy SVID ---
+    let temp_dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(Storage::open(temp_dir.path()).unwrap());
+    let keystore = Arc::new(TpmSealedStore::new(None));
+    let svid_params = rcgen::CertificateParams::new(vec!["dummy".to_string()]).unwrap();
+    let svid_key = rcgen::KeyPair::generate().unwrap();
+    let svid_cert = svid_params.self_signed(&svid_key).unwrap();
+    let svid_state = SvidState {
+        cert_chain_der: vec![svid_cert.der().to_vec()],
+        svid_version: 1,
+        generation: 1,
+    };
+    keystore.generate_and_store_sealing_key(&storage).unwrap();
+    keystore
+        .store_sealed(&storage, b"svid_private_key", &svid_key.serialize_der())
+        .unwrap();
+    let client = Arc::new(ControlPlaneClient::new(
+        addr,
+        storage,
+        keystore,
+        Arc::new(ca_pem),
+        Arc::new(tokio::sync::RwLock::new(svid_state)),
+    ));
+
+    // --- WorkloadManager with delegation ---
+    let delegated_keys = Arc::new(std::sync::RwLock::new(DelegatedKeyManager::new()));
+    let node_spiffe: SpiffeId = "spiffe://test.internal/ns/system/node/agent-1"
+        .parse()
+        .unwrap();
+
+    let containerd = Arc::new(ContainerdAdapter::new_lazy("fleetos", String::new()));
+    let tempdir = tempfile::tempdir().unwrap();
+    let volume_config = VolumeConfig {
+        scratch_root: tempdir.path().to_path_buf(),
+        allow_host_path: false,
+    };
+    let pod_manager = Arc::new(tokio::sync::RwLock::new(PodManager::new()));
+    let ip_alloc = Arc::new(std::sync::Mutex::new(
+        NodeIpAllocator::new("172.30.0.0/16").unwrap(),
+    ));
+    let wm = WorkloadManager::new(
+        containerd,
+        volume_config,
+        pod_manager.clone(),
+        None, // no NetGuard
+        "test.internal".to_string(),
+        None, // no SrcIdentityRegistry
+        ip_alloc,
+    )
+    .with_delegation(client, delegated_keys.clone(), node_spiffe, 14400);
+
+    // --- Reconcile: triggers boot_pod which requests the delegated key ---
+    wm.reconcile(&[spec]).await.unwrap();
+
+    // --- Assertions ---
+
+    // 1. The mock was called exactly once.
+    assert_eq!(
+        mock_svc.call_count.load(Ordering::SeqCst),
+        1,
+        "DelegationService must be called exactly once"
+    );
+
+    // 2. The request carried the correct target SPIFFE ID and node SVID.
+    let captured = mock_svc.last_request.lock().unwrap().take().unwrap();
+    assert_eq!(
+        captured.target_spiffe_id, "spiffe://test.internal/ns/tenant-1/sa/web",
+        "target_spiffe_id must match the workload identity"
+    );
+    assert_eq!(
+        captured.node_svid, "spiffe://test.internal/ns/system/node/agent-1",
+        "node_svid must be the agent's node identity"
+    );
+
+    // 3. The key was installed in the DelegatedKeyManager.
+    let mgr = delegated_keys.read().unwrap();
+    let now = fleetos_agent::identity::degraded::now_unix();
+    assert!(
+        mgr.has_valid_key(&expected_target, now),
+        "delegated key must be installed after boot_pod"
+    );
+
+    // 4. The key can be retrieved and has the right target.
+    let key = mgr.get_key(&expected_target, now);
+    assert!(key.is_some(), "key must be retrievable");
+    let key = key.unwrap();
+    assert_eq!(key.target_svid_id, expected_target);
+    assert_eq!(
+        key.target_role,
+        Some(WorkloadRole::try_from("primary").unwrap())
+    );
+
+    // 5. Boot itself failed (no real runtime), so no pod is registered.
+    drop(mgr);
+    let pm = pod_manager.read().await;
+    assert!(
+        pm.is_empty(),
+        "boot fails without a real runtime; no pod registered"
+    );
 }
 
 fn make_spec(workload_id: &str, runtime: RuntimeKind) -> WorkloadSpec {
@@ -135,7 +375,8 @@ fn make_ready_pod(pod_id: &str, workload_id: &str, tenant_id: &str) -> Pod {
 }
 
 #[tokio::test]
-async fn route_update_sets_router_connected_for_covered_pods() {
+async fn route_update_sets_router_connected_for_pods_with_routed_deps() {
+    // "web" calls "db": web appears in the db route's source_spiffe_ids.
     let pm = Arc::new(tokio::sync::RwLock::new(PodManager::new()));
     pm.write()
         .await
@@ -145,23 +386,20 @@ async fn route_update_sets_router_connected_for_covered_pods() {
         .add_pod(make_ready_pod("db-pod", "db", "tenant-1"));
 
     let routes = vec![RouteEntry {
-        destination_svid: "spiffe://test.internal/ns/tenant-1/sa/web".to_string(),
+        destination_svid: "spiffe://test.internal/ns/tenant-1/sa/db".to_string(),
         destination_role: "primary".to_string(),
         target_agent_svid: "spiffe://test.internal/ns/system/node/node-1".to_string(),
-        dummy_ip: 0xF000_0001,
+        dummy_ip: 0xF000_0001, // routed (non-zero)
+        source_spiffe_ids: vec!["spiffe://test.internal/ns/tenant-1/sa/web".to_string()],
     }];
 
     reevaluate_router_connected(&pm, &routes, "test.internal").await;
 
     let pm = pm.read().await;
-    assert!(
-        pm.get_pod("web-pod").unwrap().router_connected,
-        "covered pod must be connected"
-    );
-    assert!(
-        !pm.get_pod("db-pod").unwrap().router_connected,
-        "uncovered pod must be disconnected"
-    );
+    // web depends on db, and db is routed -> web is connected.
+    assert!(pm.get_pod("web-pod").unwrap().router_connected);
+    // db has no outbound deps -> trivially connected.
+    assert!(pm.get_pod("db-pod").unwrap().router_connected);
 }
 
 #[tokio::test]
@@ -171,17 +409,26 @@ async fn route_removal_flips_router_connected_false() {
         .await
         .add_pod(make_ready_pod("web-pod", "web", "tenant-1"));
 
+    // web depends on db; db is routed.
     let with_route = vec![RouteEntry {
-        destination_svid: "spiffe://test.internal/ns/tenant-1/sa/web".to_string(),
+        destination_svid: "spiffe://test.internal/ns/tenant-1/sa/db".to_string(),
         destination_role: "primary".to_string(),
         target_agent_svid: "spiffe://test.internal/ns/system/node/node-1".to_string(),
         dummy_ip: 0xF000_0001,
+        source_spiffe_ids: vec!["spiffe://test.internal/ns/tenant-1/sa/web".to_string()],
     }];
     reevaluate_router_connected(&pm, &with_route, "test.internal").await;
     assert!(pm.read().await.get_pod("web-pod").unwrap().router_connected);
 
-    // Full-state update with the route removed flips it back to false.
-    reevaluate_router_connected(&pm, &[], "test.internal").await;
+    // db's route becomes unrouted (dummy_ip = 0 sentinel) -> web flips to false.
+    let unrouted = vec![RouteEntry {
+        destination_svid: "spiffe://test.internal/ns/tenant-1/sa/db".to_string(),
+        destination_role: "primary".to_string(),
+        target_agent_svid: "spiffe://test.internal/ns/system/node/node-1".to_string(),
+        dummy_ip: 0, // unrouted sentinel
+        source_spiffe_ids: vec!["spiffe://test.internal/ns/tenant-1/sa/web".to_string()],
+    }];
+    reevaluate_router_connected(&pm, &unrouted, "test.internal").await;
     assert!(!pm.read().await.get_pod("web-pod").unwrap().router_connected);
 }
 
@@ -212,6 +459,147 @@ fn node_ip_allocator_allocates_reuses_and_rejects_dummy_space() {
     a.release("p1");
     assert_eq!(a.allocate("p3").unwrap(), x); // reused
     assert!(NodeIpAllocator::new("240.0.0.0/24").is_err()); // dummy space rejected
+}
+
+#[test]
+fn mark_started_sets_started_and_gate_term() {
+    let mut pod = Pod::new(
+        "web-pod".into(),
+        "web".into(),
+        "tenant-1".into(),
+        "primary".into(),
+        RuntimeKind::CloudHypervisor,
+        IdentityFingerprint([7; 16]),
+    );
+    // Freshly created: not started, gate cannot pass.
+    assert!(!pod.started);
+    assert!(!pod.can_transition_to_running());
+
+    // Boot confirmed -> started set.
+    pod.mark_started();
+    assert!(pod.started);
+
+    // Still not Running until policy + router are also set.
+    assert!(!pod.can_transition_to_running());
+    pod.mark_policy_enforced();
+    pod.mark_router_connected();
+    assert!(
+        pod.can_transition_to_running(),
+        "gate passes once started + policy_enforced + router_connected"
+    );
+}
+
+// --- CORE-WI-5 regression tests ---
+
+/// No outbound dependencies -> trivially connected.
+#[tokio::test]
+async fn pod_with_no_outbound_deps_is_trivially_connected() {
+    let pm = Arc::new(tokio::sync::RwLock::new(PodManager::new()));
+    pm.write()
+        .await
+        .add_pod(make_ready_pod("lonely-pod", "lonely", "tenant-1"));
+
+    // Route set exists but "lonely" appears in no source_spiffe_ids.
+    let routes = vec![RouteEntry {
+        destination_svid: "spiffe://test.internal/ns/tenant-1/sa/db".to_string(),
+        destination_role: "primary".to_string(),
+        target_agent_svid: "spiffe://test.internal/ns/system/node/node-1".to_string(),
+        dummy_ip: 0xF000_0001,
+        source_spiffe_ids: vec!["spiffe://test.internal/ns/tenant-1/sa/other".to_string()],
+    }];
+    reevaluate_router_connected(&pm, &routes, "test.internal").await;
+    assert!(
+        pm.read()
+            .await
+            .get_pod("lonely-pod")
+            .unwrap()
+            .router_connected
+    );
+
+    // Also true with an empty route set.
+    reevaluate_router_connected(&pm, &[], "test.internal").await;
+    assert!(
+        pm.read()
+            .await
+            .get_pod("lonely-pod")
+            .unwrap()
+            .router_connected
+    );
+}
+
+/// Dependencies unrouted (dummy_ip = 0) -> disconnected.
+#[tokio::test]
+async fn pod_with_unrouted_deps_is_disconnected() {
+    let pm = Arc::new(tokio::sync::RwLock::new(PodManager::new()));
+    pm.write()
+        .await
+        .add_pod(make_ready_pod("web-pod", "web", "tenant-1"));
+
+    let routes = vec![RouteEntry {
+        destination_svid: "spiffe://test.internal/ns/tenant-1/sa/db".to_string(),
+        destination_role: "primary".to_string(),
+        target_agent_svid: "spiffe://test.internal/ns/system/node/node-1".to_string(),
+        dummy_ip: 0, // unrouted sentinel
+        source_spiffe_ids: vec!["spiffe://test.internal/ns/tenant-1/sa/web".to_string()],
+    }];
+    reevaluate_router_connected(&pm, &routes, "test.internal").await;
+    assert!(!pm.read().await.get_pod("web-pod").unwrap().router_connected);
+}
+
+/// Regression: pure-client pod (calls others, never called) must NOT be stuck
+/// disconnected. It has outbound deps; once they're routed it's connected.
+#[tokio::test]
+async fn pure_client_pod_not_stuck_disconnected() {
+    let pm = Arc::new(tokio::sync::RwLock::new(PodManager::new()));
+    // "client" only calls "db"; it is never a destination itself.
+    pm.write()
+        .await
+        .add_pod(make_ready_pod("client-pod", "client", "tenant-1"));
+
+    let routes = vec![RouteEntry {
+        destination_svid: "spiffe://test.internal/ns/tenant-1/sa/db".to_string(),
+        destination_role: "primary".to_string(),
+        target_agent_svid: "spiffe://test.internal/ns/system/node/node-1".to_string(),
+        dummy_ip: 0xF000_0001,
+        source_spiffe_ids: vec!["spiffe://test.internal/ns/tenant-1/sa/client".to_string()],
+    }];
+    reevaluate_router_connected(&pm, &routes, "test.internal").await;
+    assert!(
+        pm.read()
+            .await
+            .get_pod("client-pod")
+            .unwrap()
+            .router_connected,
+        "pure-client pod must not be stuck disconnected"
+    );
+}
+
+/// Regression: server-only pod (called, never calls) must NOT be connected
+/// trivially via destination matching. It has no outbound deps, so it's
+/// connected only because it has nothing to depend on — NOT because it's a
+/// destination. Verify the logic doesn't key off destination.
+#[tokio::test]
+async fn server_only_pod_not_trivially_connected_via_destination() {
+    let pm = Arc::new(tokio::sync::RwLock::new(PodManager::new()));
+    // "db" is only ever a destination, never a source.
+    pm.write()
+        .await
+        .add_pod(make_ready_pod("db-pod", "db", "tenant-1"));
+
+    // db appears as a destination but NOT in any source_spiffe_ids.
+    let routes = vec![RouteEntry {
+        destination_svid: "spiffe://test.internal/ns/tenant-1/sa/db".to_string(),
+        destination_role: "primary".to_string(),
+        target_agent_svid: "spiffe://test.internal/ns/system/node/node-1".to_string(),
+        dummy_ip: 0xF000_0001,
+        source_spiffe_ids: vec!["spiffe://test.internal/ns/tenant-1/sa/web".to_string()],
+    }];
+    reevaluate_router_connected(&pm, &routes, "test.internal").await;
+    // db has no outbound deps -> connected=true, but because it has no deps,
+    // NOT because it's a destination. (Under the old destination-based logic,
+    // this would also be true, but for the wrong reason; this test documents
+    // that the value is correct and the new logic doesn't depend on destination.)
+    assert!(pm.read().await.get_pod("db-pod").unwrap().router_connected);
 }
 
 #[tokio::test]

@@ -68,6 +68,8 @@ map_headroom_percent = 20
 [svid]
 ttl_secs = 3600           # 1 hour
 refresh_fraction = 0.75   # refresh at 75% elapsed
+workload_ttl_secs = 3600         # 1 hour (workload SVIDs minted by the agent)
+delegated_key_ttl_secs = 14400   # 4 hours (delegated signing keys)
 
 # ---------------------------------------------------------------------------
 # VSOCK attestation server (for MicroVM guest attestation, CR-CORE-6)

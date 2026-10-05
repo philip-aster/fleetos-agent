@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fleetos_agent::error::AgentError;
+use fleetos_agent::identity::degraded::DelegatedKeyManager;
 use fleetos_agent::vsock_attest::config_push::WorkloadConfigBuilder;
 use fleetos_agent::vsock_attest::measure::BootMeasurement;
 use fleetos_agent::vsock_attest::measure::compute_boot_measurement;
@@ -117,6 +118,8 @@ fn make_server() -> Arc<VsockAttestServer> {
         Arc::new(VsockQuoteVerifier::new()),
         Arc::new(WorkloadConfigBuilder::new(
             "fleet.test.internal".to_string(),
+            Arc::new(std::sync::RwLock::new(DelegatedKeyManager::new())),
+            3600,
         )),
     ))
 }
@@ -220,6 +223,8 @@ fn dev_software_quote_accepted_and_config_pushed() {
 fn host_measured_quote_accepted_and_context_pushed() {
     let config_builder = Arc::new(WorkloadConfigBuilder::new(
         "fleet.test.internal".to_string(),
+        Arc::new(std::sync::RwLock::new(DelegatedKeyManager::new())),
+        3600,
     ));
     config_builder.set_dummy_ip_routes(vec![dummy_route()]);
     let server = Arc::new(VsockAttestServer::new(
