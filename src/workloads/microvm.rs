@@ -9,7 +9,7 @@
 //! BOOT_GATE) BEFORE this adapter brings the TAP up and boots the VM.
 
 use super::WorkloadSpec;
-use super::volumes::PreparedMount;
+use super::volumes::{PreparedMount, VolumeSource};
 use crate::error::AgentError;
 use cloud_hypervisor_client::apis::DefaultApi;
 
@@ -41,6 +41,30 @@ pub struct MicroVmAdapter {
     client: cloud_hypervisor_client::SocketBasedApiClient,
 }
 
+/// Validate mounts for a MicroVM boot. Fail-closed (CR-CORE-2).
+///
+/// MicroVMs cannot expose host-backed mounts in v1:
+/// - `EmptyDir`: per-pod scratch, provided inside the guest as tmpfs by
+///   fleetos-guest-init from `WorkloadConfig.volume_mounts`. Nothing to
+///   attach at the Cloud Hypervisor level.
+/// - `HostPath`: rejected outright. `prepare_mounts` only emits HostPath when
+///   `VolumeConfig.allow_host_path = true`; silently booting without exposing
+///   the mount here would leave a declared volume silently missing.
+pub fn validate_microvm_mounts(mounts: &[PreparedMount]) -> Result<(), AgentError> {
+    for m in mounts {
+        match m.source {
+            VolumeSource::EmptyDir { .. } => {}
+            VolumeSource::HostPath { .. } => {
+                return Err(AgentError::Workload(format!(
+                    "microvm boot rejected: hostPath volume '{}' cannot be exposed to a MicroVM (CR-CORE-2, fail-closed)",
+                    m.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl MicroVmAdapter {
     /// Create the adapter bound to a CH API socket path.
     pub fn new(api_socket: &str) -> Result<Self, AgentError> {
@@ -57,18 +81,22 @@ impl MicroVmAdapter {
         &self.api_socket
     }
 
-    /// Boot a MicroVM.
+    /// Boot a MicroVM. Returns the VSOCK CID.
     ///
-    /// PRECONDITION: WorkloadManager has already armed VmNetGuard. This method
-    /// builds the CH config, defines the VM, and boots it. Fail-closed on error.
-    // ...
+    /// BOOT-RACE GUARD (non-negotiable): the caller MUST have armed VmNetGuard
+    /// (TC attach + map population + BOOT_GATE arm) BEFORE calling this method.
     pub async fn boot(
         &self,
         spec: &WorkloadSpec,
         vsock_cid: u32,
         mounts: &[PreparedMount],
         rootfs_path: &str,
+        tap_name: &str,
+        gateway_ip: std::net::Ipv4Addr,
     ) -> Result<u32, AgentError> {
+        // CR-CORE-2 fail-closed mount gate: reject before touching any SDK state.
+        validate_microvm_mounts(mounts)?;
+
         let pod_spec = spec
             .pod_spec
             .as_ref()
@@ -77,11 +105,9 @@ impl MicroVmAdapter {
             Some(r) => (r.vcpus as u8, r.memory_mb as u64),
             None => (1, 512),
         };
-        // Build the CH VM config (kernel, erofs rootfs disk, vsock, net).
-        // SDK VERIFICATION POINT: VmConfig field names verified against cloud-hypervisor
-        // OpenAPI spec 0.3.0 (cpus, memory, payload, disks, vsock).
+
         use cloud_hypervisor_client::models::{
-            CpusConfig, DiskConfig, MemoryConfig, PayloadConfig, VmConfig, VsockConfig,
+            CpusConfig, DiskConfig, MemoryConfig, NetConfig, PayloadConfig, VmConfig, VsockConfig,
         };
 
         let cpus = CpusConfig {
@@ -95,7 +121,7 @@ impl MicroVmAdapter {
             ..Default::default()
         };
 
-        // TODO(7.7.6): kernel_path should come from AgentConfig.vsock_attest.kernel_path
+        // PayloadConfig is NOT an Option on VmConfig
         let payload = PayloadConfig {
             kernel: Some("/var/lib/fleetos/vmlinux".to_string()),
             ..Default::default()
@@ -103,46 +129,55 @@ impl MicroVmAdapter {
 
         let disk = DiskConfig {
             path: Some(rootfs_path.to_string()),
-            readonly: Some(true), // erofs rootfs is read-only
+            readonly: Some(true),
             ..Default::default()
         };
 
-        // VsockConfig.socket is for host-initiated connections; we use guest-initiated
-        // to HOST_CID (2), so we leave socket empty and just assign the guest CID.
+        // VsockConfig.socket is a String, NOT an Option<String>
         let vsock = VsockConfig {
             cid: vsock_cid as i64,
+            socket: format!("/run/fleetos/vms/{}.vsock", spec.workload_id),
+            ..Default::default()
+        };
+
+        let net = NetConfig {
+            tap: Some(tap_name.to_string()),
+            ip: Some(gateway_ip.to_string()),
+            mask: Some("255.255.255.252".to_string()),
+            num_queues: Some(2),
+            queue_size: Some(256),
+            id: Some(format!("net-{}", spec.workload_id)),
             ..Default::default()
         };
 
         let vm_config = VmConfig {
             cpus: Some(cpus),
             memory: Some(memory),
-            payload,
+            payload, // Direct assignment, no Some()
             disks: Some(vec![disk]),
             vsock: Some(vsock),
+            net: Some(vec![net]),
             ..Default::default()
         };
 
-        // Define + boot the VM.
-        // SDK VERIFICATION POINT: create_vm / boot_vm call names.
+        // Use self.client directly (no connect method exists)
         self.client
             .create_vm(vm_config)
             .await
             .map_err(|e| AgentError::Workload(format!("CH vm.create: {e}")))?;
+
         self.client
             .boot_vm()
             .await
             .map_err(|e| AgentError::Workload(format!("CH vm.boot: {e}")))?;
 
-        let _ = mounts; // Guest-init mounts are pushed via WorkloadConfig (VSOCK), not CH.
         tracing::info!(
-            workload = %spec.workload_id,
-            vsock_cid,
-            vcpus,
-            mem_mb,
-            "cloud-hypervisor MicroVM booted"
+            workload_id = %spec.workload_id,
+            cid = vsock_cid,
+            tap = %tap_name,
+            "Cloud Hypervisor MicroVM booted"
         );
-        // The CH process PID is managed by the SDK/supervisor; return vsock_cid as the handle.
+
         Ok(vsock_cid)
     }
 

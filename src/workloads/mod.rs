@@ -342,6 +342,10 @@ impl WorkloadManager {
         spec: &WorkloadSpec,
         mounts: &[PreparedMount],
     ) -> Result<u32, AgentError> {
+        // Fail-closed before side effects (CID allocation, NetGuard arm):
+        // reject mounts this runtime cannot honor.
+        microvm::validate_microvm_mounts(mounts)?;
+
         // Allocate a VSOCK CID for this MicroVM.
         let vsock_cid = self.cid_allocator.write().await.allocate();
         // BOOT-RACE GUARD (non-negotiable): arm BEFORE the VM boots / TAP comes up.
@@ -364,8 +368,25 @@ impl WorkloadManager {
             crate::workloads::image::oci_to_erofs(&spec.image, &self.image_cache_path)?;
         let rootfs_path_str = rootfs_path.to_string_lossy().to_string();
 
+        // Derive a gateway IP for the TAP interface (/30 point-to-point link).
+        // The agent acts as the gateway, the guest gets gateway_ip + 1.
+        let gateway_ip = std::net::Ipv4Addr::new(
+            10,
+            0,
+            (vsock_cid / 256) as u8,
+            ((vsock_cid % 256) * 4) as u8,
+        );
+
+        // Pass the TAP interface name and the gateway IP to the MicroVM adapter
         let handle = adapter
-            .boot(spec, vsock_cid, mounts, &rootfs_path_str)
+            .boot(
+                spec,
+                vsock_cid,
+                mounts,
+                &rootfs_path_str,
+                &interface,
+                gateway_ip,
+            )
             .await?;
         self.microvms.write().await.insert(vsock_cid, adapter);
         Ok(handle)

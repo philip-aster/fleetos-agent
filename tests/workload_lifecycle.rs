@@ -955,3 +955,81 @@ fn boot_fingerprint_is_real_and_canonical() {
         workload_fingerprint("fleet.test.internal", "tenant-1", "web", "replica").unwrap();
     assert_ne!(fp, fp_replica);
 }
+
+// =========================================================================
+// MicroVM mount validation (CR-CORE-2 fail-closed gate)
+// =========================================================================
+
+fn make_prepared_mount(
+    name: &str,
+    source: fleetos_agent::workloads::volumes::VolumeSource,
+) -> fleetos_agent::workloads::volumes::PreparedMount {
+    fleetos_agent::workloads::volumes::PreparedMount {
+        name: name.to_owned(),
+        mount_path: format!("/mnt/{}", name),
+        read_only: false,
+        host_path: std::path::PathBuf::from(format!("/tmp/{}", name)),
+        source,
+    }
+}
+
+#[test]
+fn microvm_mount_validation_accepts_emptydir() {
+    use fleetos_agent::workloads::microvm::validate_microvm_mounts;
+    use fleetos_agent::workloads::volumes::VolumeSource;
+    let mounts = vec![make_prepared_mount(
+        "scratch",
+        VolumeSource::EmptyDir {
+            size_limit_bytes: None,
+        },
+    )];
+    assert!(validate_microvm_mounts(&mounts).is_ok());
+}
+
+#[test]
+fn microvm_mount_validation_rejects_hostpath() {
+    use fleetos_agent::workloads::microvm::validate_microvm_mounts;
+    use fleetos_agent::workloads::volumes::VolumeSource;
+    let mounts = vec![make_prepared_mount(
+        "hostvol",
+        VolumeSource::HostPath { host_path_type: 1 },
+    )];
+    let err = validate_microvm_mounts(&mounts).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("hostPath"),
+        "error must name the source: {}",
+        msg
+    );
+    assert!(
+        msg.contains("CR-CORE-2"),
+        "error must cite the rule: {}",
+        msg
+    );
+}
+
+#[tokio::test]
+async fn microvm_boot_rejects_hostpath_before_any_sdk_call() {
+    use fleetos_agent::workloads::microvm::MicroVmAdapter;
+    use fleetos_agent::workloads::volumes::VolumeSource;
+    // No Cloud Hypervisor at this path — deliberate: the rejection must fire
+    // before any SDK call, so no socket is required.
+    let adapter = MicroVmAdapter::new("/tmp/fleetos-test-no-ch.sock").unwrap();
+    let spec = make_spec("web", RuntimeKind::CloudHypervisor);
+    let mounts = vec![make_prepared_mount(
+        "hostvol",
+        VolumeSource::HostPath { host_path_type: 1 },
+    )];
+    let err = adapter
+        .boot(
+            &spec,
+            3,
+            &mounts,
+            "/tmp/rootfs.erofs",
+            "vmtap3",
+            std::net::Ipv4Addr::new(10, 0, 0, 1),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("hostPath"));
+}
