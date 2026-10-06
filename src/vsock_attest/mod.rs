@@ -248,7 +248,7 @@ struct SockaddrVm {
 }
 
 /// Bind and listen on AF_VSOCK.
-fn vsock_listen() -> Result<std::os::fd::OwnedFd, AgentError> {
+pub fn vsock_listen() -> Result<std::os::fd::OwnedFd, AgentError> {
     unsafe {
         let fd = libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0);
         if fd < 0 {
@@ -286,7 +286,7 @@ fn vsock_listen() -> Result<std::os::fd::OwnedFd, AgentError> {
 }
 
 /// Accept a single VSOCK connection. Returns the stream fd and the peer CID.
-fn vsock_accept(listener_fd: i32) -> Result<(std::os::fd::OwnedFd, u32), AgentError> {
+pub fn vsock_accept(listener_fd: i32) -> Result<(std::os::fd::OwnedFd, u32), AgentError> {
     use std::os::fd::FromRawFd;
 
     let mut addr: SockaddrVm = unsafe { std::mem::zeroed() };

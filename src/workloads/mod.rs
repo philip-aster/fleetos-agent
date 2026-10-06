@@ -348,48 +348,66 @@ impl WorkloadManager {
 
         // Allocate a VSOCK CID for this MicroVM.
         let vsock_cid = self.cid_allocator.write().await.allocate();
-        // BOOT-RACE GUARD (non-negotiable): arm BEFORE the VM boots / TAP comes up.
-        // Fail-closed: if there is no guard or arming fails, abort the boot.
         let interface = format!("vmtap{}", vsock_cid);
-        match &self.net_guard {
-            Some(guard) => guard.arm(&interface)?,
+
+        // Capture the guard so we can disarm it on failure
+        let guard = match &self.net_guard {
+            Some(guard) => guard,
             None => {
                 return Err(AgentError::Workload(
                        "boot aborted: NetGuard (VmNetGuard) not armed before MicroVM boot (fail-closed)".into(),
                    ));
             }
+        };
+
+        // BOOT-RACE GUARD (non-negotiable): arm BEFORE the VM boots / TAP comes up.
+        guard.arm(&interface)?;
+
+        // 7.8.1: Wrap the rest of the boot sequence so we can disarm NetGuard
+        // if ANY step fails before the VM is successfully running.
+        let result = async {
+            // Create + boot the MicroVM adapter.
+            let api_socket = format!("/run/fleetos/vm/{}/api.sock", vsock_cid);
+            let adapter = Arc::new(MicroVmAdapter::new(&api_socket)?);
+
+            // Phase 7.7.3: Resolve OCI image to erofs rootfs path.
+            let rootfs_path =
+                crate::workloads::image::oci_to_erofs(&spec.image, &self.image_cache_path)?;
+            let rootfs_path_str = rootfs_path.to_string_lossy().to_string();
+
+            // Derive a gateway IP for the TAP interface (/30 point-to-point link).
+            let gateway_ip = std::net::Ipv4Addr::new(
+                10,
+                0,
+                (vsock_cid / 256) as u8,
+                ((vsock_cid % 256) * 4) as u8,
+            );
+
+            // Pass the TAP interface name and the gateway IP to the MicroVM adapter
+            let handle = adapter
+                .boot(
+                    spec,
+                    vsock_cid,
+                    mounts,
+                    &rootfs_path_str,
+                    &interface,
+                    gateway_ip,
+                )
+                .await?;
+
+            self.microvms.write().await.insert(vsock_cid, adapter);
+            Ok::<u32, AgentError>(handle)
         }
-        // Create + boot the MicroVM adapter.
-        let api_socket = format!("/run/fleetos/vm/{}/api.sock", vsock_cid);
-        let adapter = Arc::new(MicroVmAdapter::new(&api_socket)?);
+        .await;
 
-        // Phase 7.7.3: Resolve OCI image to erofs rootfs path.
-        let rootfs_path =
-            crate::workloads::image::oci_to_erofs(&spec.image, &self.image_cache_path)?;
-        let rootfs_path_str = rootfs_path.to_string_lossy().to_string();
-
-        // Derive a gateway IP for the TAP interface (/30 point-to-point link).
-        // The agent acts as the gateway, the guest gets gateway_ip + 1.
-        let gateway_ip = std::net::Ipv4Addr::new(
-            10,
-            0,
-            (vsock_cid / 256) as u8,
-            ((vsock_cid % 256) * 4) as u8,
-        );
-
-        // Pass the TAP interface name and the gateway IP to the MicroVM adapter
-        let handle = adapter
-            .boot(
-                spec,
-                vsock_cid,
-                mounts,
-                &rootfs_path_str,
-                &interface,
-                gateway_ip,
-            )
-            .await?;
-        self.microvms.write().await.insert(vsock_cid, adapter);
-        Ok(handle)
+        match result {
+            Ok(handle) => Ok(handle),
+            Err(e) => {
+                tracing::error!(vsock_cid, error = %e, "MicroVM boot failed, disarming NetGuard to prevent double-attach on retry");
+                let _ = guard.disarm(&interface);
+                Err(e)
+            }
+        }
     }
 
     /// Evict a pod: stop via the right adapter, tear down scratch, remove record.

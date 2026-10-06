@@ -122,3 +122,76 @@ fn host_cid_is_2() {
 fn vsock_port_is_0x4649() {
     assert_eq!(VSOCK_PORT, 0x4649);
 }
+
+// =========================================================================
+// 7.8.2: Real AF_VSOCK transport smoke test (gated)
+// =========================================================================
+
+#[test]
+fn real_af_vsock_transport_smoke() {
+    if std::env::var("FLEETOS_VSOCK_TESTS").unwrap_or_default() != "1" {
+        eprintln!(
+            "Skipping real AF_VSOCK test (set FLEETOS_VSOCK_TESTS=1 to run on vhost_vsock-capable host)"
+        );
+        return;
+    }
+
+    use std::os::fd::AsRawFd;
+
+    // Bind the server
+    let listener = fleetos_agent::vsock_attest::vsock_listen()
+        .expect("vsock_listen failed (is vhost_vsock loaded and accessible?)");
+    let listener_fd = listener.as_raw_fd();
+
+    // Spawn a thread to connect and act as guest
+    let guest_thread = std::thread::spawn(move || {
+        unsafe {
+            let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
+            assert!(
+                fd >= 0,
+                "socket(AF_VSOCK) failed for guest: {}",
+                std::io::Error::last_os_error()
+            );
+
+            let mut addr: libc::sockaddr_vm = std::mem::zeroed();
+            addr.svm_family = libc::AF_VSOCK as u16;
+            addr.svm_port = VSOCK_PORT;
+            addr.svm_cid = HOST_CID;
+
+            let ret = libc::connect(
+                fd,
+                &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+            );
+            assert!(
+                ret == 0,
+                "connect() failed: {}",
+                std::io::Error::last_os_error()
+            );
+
+            // Keep connection open briefly so the host can accept it
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            libc::close(fd);
+        }
+    });
+
+    // Accept the connection and extract CID
+    let (_stream, peer_cid) =
+        fleetos_agent::vsock_attest::vsock_accept(listener_fd).expect("vsock_accept failed");
+
+    // On Linux, the host sees the guest's CID as the peer CID.
+    // The guest connected from some dynamic CID (usually 3 or higher if vhost_vsock is used).
+    assert!(
+        peer_cid >= 3,
+        "Extracted CID {} should be a valid guest CID (>= 3)",
+        peer_cid
+    );
+
+    guest_thread.join().expect("guest thread panicked");
+
+    println!(
+        "Successfully bound AF_VSOCK and extracted peer CID: {}",
+        peer_cid
+    );
+}
