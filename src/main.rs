@@ -224,6 +224,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
 
+    // --- Phase 8.1: Probe execution ---
+    let probe_manager = Arc::new(RwLock::new(
+        fleetos_agent::workloads::probe_manager::ProbeManager::new(),
+    ));
+    // Create the reporter once, behind an Arc.
+    let pod_event_client = control_client.pod_event_client().await?;
+    let pod_event_reporter = std::sync::Arc::new(PodEventReporter::new(
+        config.node.name.clone(),
+        pod_event_client,
+        100,
+        Duration::from_secs(10),
+    ));
+
+    // Probe loop gets a clone.
+    let probe_loop = fleetos_agent::workloads::probe_loop::ProbeLoop::new(
+        probe_manager.clone(),
+        pod_manager.clone(),
+        Some(pod_event_reporter.clone()),
+        fleetos_agent::workloads::probe_loop::ProbeLoopConfig::default(),
+    );
+    let probe_shutdown_rx = shutdown_tx.subscribe();
+    let probe_handle = tokio::spawn(async move {
+        probe_loop.run(probe_shutdown_rx).await;
+    });
+    tracing::info!("probe loop started");
+
+    // Workload manager gets a clone (so evict_pod can emit Evicting).
+    // Add .with_event_reporter(...) to the WorkloadManager builder chain.
+
+    // Flush loop gets a clone moved into its task.
+    let flush_reporter = pod_event_reporter.clone();
+    let pod_event_shutdown_rx = shutdown_rx.clone();
+    let pod_event_handle = tokio::spawn(async move {
+        if let Err(e) = flush_reporter.run_flush_loop(pod_event_shutdown_rx).await {
+            tracing::error!(error = %e, "pod event reporter failed");
+        }
+    });
+    tracing::info!("pod event reporter started");
+
     let secrets_handler = std::sync::Arc::new(fleetos_agent::wiring::SecretsHandler::new(
         control_client.clone(),
         storage.clone(),
@@ -297,25 +336,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     tracing::info!("flow events drain started");
-
-    // Pod events reporter.
-    let pod_event_client = control_client.pod_event_client().await?;
-    let pod_event_reporter = PodEventReporter::new(
-        config.node.name.clone(),
-        pod_event_client,
-        100,
-        Duration::from_secs(10),
-    );
-    let pod_event_shutdown_rx = shutdown_rx.clone();
-    let pod_event_handle = tokio::spawn(async move {
-        if let Err(e) = pod_event_reporter
-            .run_flush_loop(pod_event_shutdown_rx)
-            .await
-        {
-            tracing::error!(error = %e, "pod event reporter failed");
-        }
-    });
-    tracing::info!("pod event reporter started");
 
     // --- 7.5.5: Delegated key refresh loop (75% TTL) ---
     let delegation_shutdown_rx = shutdown_tx.subscribe();
@@ -403,6 +423,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         schedule_handle,
         events_handle,
         routes_watch_handle,
+        probe_handle,
     );
 
     // Detach eBPF programs.

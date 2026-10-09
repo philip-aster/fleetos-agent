@@ -183,7 +183,7 @@ async fn pod_events_batch_and_flush() {
     let client = PodEventServiceClient::new(channel);
 
     // batch_size 100 → recording 2 events does NOT auto-flush.
-    let mut reporter =
+    let reporter =
         PodEventReporter::new("node-1".to_string(), client, 100, Duration::from_secs(60));
 
     reporter
@@ -231,8 +231,7 @@ async fn pod_events_auto_flush_when_batch_full() {
     let client = PodEventServiceClient::new(channel);
 
     // batch_size 2 → the second record_event triggers an automatic flush.
-    let mut reporter =
-        PodEventReporter::new("node-2".to_string(), client, 2, Duration::from_secs(60));
+    let reporter = PodEventReporter::new("node-2".to_string(), client, 2, Duration::from_secs(60));
 
     reporter
         .record_event("pod-a", event_types::CREATED, "", "")

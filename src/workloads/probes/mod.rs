@@ -146,6 +146,22 @@ impl ProbeRunner {
         self.phase == ProbePhase::Failed
     }
 
+    /// Whether the probe is currently failing, honoring `failure_threshold`.
+    ///
+    /// A probe only counts as failed after `failure_threshold` consecutive
+    /// failures. `is_failing()` alone fires on the first red probe, which
+    /// would mark a pod dead prematurely and trigger control-side replacement
+    /// storms — this accessor is the one the probe loop must use.
+    pub fn is_live_passing(&self) -> bool {
+        self.consecutive_failures < self.failure_threshold
+    }
+
+    /// Whether the probe is passing readiness, honoring `success_threshold`.
+    /// A probe counts as ready after `success_threshold` consecutive successes.
+    pub fn is_ready_passing(&self) -> bool {
+        self.consecutive_successes >= self.success_threshold
+    }
+
     /// Get the current phase.
     pub fn phase(&self) -> ProbePhase {
         self.phase
@@ -180,7 +196,9 @@ impl ProbeSetRunner {
 
     /// Run all due probes. Returns (liveness_passing, readiness_passing).
     ///
-    /// Startup probe gates liveness and readiness.
+    /// Startup probe gates liveness and readiness. Liveness only reports
+    /// failing after `failure_threshold` consecutive failures (see
+    /// `ProbeRunner::is_live_passing`); readiness honors `success_threshold`.
     pub fn run_probes(&mut self) -> (bool, bool) {
         // Run startup probe first.
         if let Some(startup) = &mut self.startup {
@@ -188,49 +206,45 @@ impl ProbeSetRunner {
                 startup.probe();
             }
         }
-
         // If startup not done, liveness and readiness report passing.
         if !self.startup_done() {
             return (true, true);
         }
-
         // Run liveness probe.
         let liveness_passing = match &mut self.liveness {
             Some(runner) => {
                 if runner.is_due() {
                     runner.probe();
                 }
-                runner.is_passing()
+                runner.is_live_passing()
             }
             None => true,
         };
-
         // Run readiness probe.
         let readiness_passing = match &mut self.readiness {
             Some(runner) => {
                 if runner.is_due() {
                     runner.probe();
                 }
-                runner.is_passing()
+                runner.is_ready_passing()
             }
             None => true,
         };
-
         (liveness_passing, readiness_passing)
     }
 
-    /// Whether all probes are passing.
+    /// Whether all probes are passing (threshold-aware).
     pub fn all_passing(&self) -> bool {
         let startup_ok = self.startup_done();
         let liveness_ok = self
             .liveness
             .as_ref()
-            .map(|r| r.is_passing())
+            .map(|r| r.is_live_passing())
             .unwrap_or(true);
         let readiness_ok = self
             .readiness
             .as_ref()
-            .map(|r| r.is_passing())
+            .map(|r| r.is_ready_passing())
             .unwrap_or(true);
         startup_ok && liveness_ok && readiness_ok
     }

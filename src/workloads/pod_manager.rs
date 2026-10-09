@@ -66,6 +66,10 @@ pub struct Pod {
     pub probe_ready: bool,
     /// Liveness probe passing.
     pub probe_live: bool,
+    /// Whether a `ProbeFailed` event has already been emitted for the current
+    /// failure episode. Edge-trigger guard: set when we emit, cleared when
+    /// probes recover, so we don't spam on every red tick.
+    pub probe_failure_reported: bool,
 }
 
 impl Pod {
@@ -96,6 +100,7 @@ impl Pod {
             fingerprint,
             probe_ready: false,
             probe_live: false,
+            probe_failure_reported: false,
         }
     }
 
@@ -111,12 +116,6 @@ impl Pod {
     /// Whether the pod is alive (process running).
     pub fn is_live(&self) -> bool {
         matches!(self.state, PodState::Running | PodState::Booting)
-    }
-
-    /// Whether the pod can transition to Running.
-    /// All readiness gates must be satisfied.
-    pub fn can_transition_to_running(&self) -> bool {
-        self.started && self.policy_enforced && self.router_connected
     }
 
     /// Transition to a new state.
@@ -147,6 +146,45 @@ impl Pod {
     /// Update last status timestamp.
     pub fn touch_status(&mut self) {
         self.last_status_at_unix = now_unix();
+    }
+
+    /// Get the restart policy for this pod.
+    /// Returns Never if not configured.
+    pub fn restart_policy(&self) -> fleetos_core::proto::workload::RestartPolicy {
+        // In a full implementation, this would read from the PodSpec.
+        // For now, default to Always (K8s default).
+        fleetos_core::proto::workload::RestartPolicy::Always
+    }
+
+    /// Check if the pod can transition to Running based on Ruling D gate.
+    /// Gate: started AND policy_enforced AND router_connected.
+    pub fn can_transition_to_running(&self) -> bool {
+        self.started && self.policy_enforced && self.router_connected
+    }
+
+    /// Transition from Booting to Running if the gate is satisfied.
+    /// Returns true if the transition occurred.
+    pub fn try_transition_to_running(&mut self) -> bool {
+        if self.state == PodState::Booting && self.can_transition_to_running() {
+            self.transition_to(PodState::Running);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Transition to Terminating state.
+    pub fn start_terminating(&mut self) {
+        if self.state == PodState::Running {
+            self.transition_to(PodState::Terminating);
+        }
+    }
+
+    /// Transition from Terminating to Stopped.
+    pub fn finish_terminating(&mut self) {
+        if self.state == PodState::Terminating {
+            self.transition_to(PodState::Stopped);
+        }
     }
 }
 

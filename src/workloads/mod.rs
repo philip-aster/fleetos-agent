@@ -10,6 +10,8 @@ pub mod image;
 pub mod lifecycle;
 pub mod microvm;
 pub mod pod_manager;
+pub mod probe_loop;
+pub mod probe_manager;
 pub mod probes;
 pub mod reconciler;
 pub mod status;
@@ -140,6 +142,8 @@ pub struct WorkloadManager {
     delegated_keys: Option<Arc<std::sync::RwLock<crate::identity::degraded::DelegatedKeyManager>>>,
     node_spiffe_id: Option<SpiffeId>,
     delegated_key_ttl_secs: u64,
+    /// Optional event reporter for pod lifecycle events.
+    event_reporter: Option<Arc<crate::observability::pod_events::PodEventReporter>>,
 }
 
 impl WorkloadManager {
@@ -169,7 +173,16 @@ impl WorkloadManager {
             delegated_keys: None,
             node_spiffe_id: None,
             delegated_key_ttl_secs: crate::identity::degraded::DEFAULT_DELEGATED_KEY_TTL_SECS,
+            event_reporter: None,
         }
+    }
+
+    pub fn with_event_reporter(
+        mut self,
+        reporter: Arc<crate::observability::pod_events::PodEventReporter>,
+    ) -> Self {
+        self.event_reporter = Some(reporter);
+        self
     }
 
     /// Reconcile desired state against running pods and apply.
@@ -420,6 +433,15 @@ impl WorkloadManager {
             let grace = 30; // Default grace; refine from TerminationSpec in Phase 5.
             (pod.runtime, pod.pid.unwrap_or(0), grace)
         };
+
+        if let Some(ref event_reporter) = self.event_reporter {
+            if let Err(e) = event_reporter
+                .record_event(pod_id, "Evicting", "", "")
+                .await
+            {
+                tracing::warn!(pod_id = %pod_id, error = %e, "failed to emit Evicting event");
+            }
+        }
 
         match runtime {
             RuntimeKind::Containerd => {
