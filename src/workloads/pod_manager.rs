@@ -70,6 +70,10 @@ pub struct Pod {
     /// failure episode. Edge-trigger guard: set when we emit, cleared when
     /// probes recover, so we don't spam on every red tick.
     pub probe_failure_reported: bool,
+    /// Whether the pod has ever been observed all-passing. Gates `ProbeFailed`
+    /// emission so transient failures during initial startup (before the pod
+    /// has ever been healthy) don't emit noise.
+    pub probe_ever_passed: bool,
 }
 
 impl Pod {
@@ -101,6 +105,7 @@ impl Pod {
             probe_ready: false,
             probe_live: false,
             probe_failure_reported: false,
+            probe_ever_passed: false,
         }
     }
 
@@ -184,6 +189,16 @@ impl Pod {
     pub fn finish_terminating(&mut self) {
         if self.state == PodState::Terminating {
             self.transition_to(PodState::Stopped);
+        }
+    }
+
+    /// Transition to Terminating for eviction, from any active state.
+    pub fn begin_eviction(&mut self) {
+        if matches!(
+            self.state,
+            PodState::Pending | PodState::Booting | PodState::Running
+        ) {
+            self.state = PodState::Terminating;
         }
     }
 }

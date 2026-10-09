@@ -205,6 +205,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fleetos_agent::workloads::NodeIpAllocator::new(&config.networking.workload_ip_cidr)?,
     ));
 
+    // --- Phase 8.1: Probe execution ---
+    let probe_manager = Arc::new(RwLock::new(
+        fleetos_agent::workloads::probe_manager::ProbeManager::new(),
+    ));
+
     let workload_manager = std::sync::Arc::new(
         fleetos_agent::workloads::WorkloadManager::new(
             containerd_adapter.clone(),
@@ -221,13 +226,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             delegated_keys.clone(),
             node_spiffe_id.clone(),
             config.svid.delegated_key_ttl_secs,
-        ),
+        )
+        .with_probes(probe_manager.clone()),
     );
 
-    // --- Phase 8.1: Probe execution ---
-    let probe_manager = Arc::new(RwLock::new(
-        fleetos_agent::workloads::probe_manager::ProbeManager::new(),
-    ));
     // Create the reporter once, behind an Arc.
     let pod_event_client = control_client.pod_event_client().await?;
     let pod_event_reporter = std::sync::Arc::new(PodEventReporter::new(

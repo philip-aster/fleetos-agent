@@ -18,9 +18,8 @@ pub struct ProbeTickResult {
     pub ready: bool,
     /// All configured probes are currently passing (startup complete, and
     /// liveness + readiness passing where configured). This is a *level*, not
-    /// an edge: it is true on every tick where probes pass, not only the first.
-    /// The probe loop combines it with the pod's current state to decide when
-    /// to transition Booting → Running.
+    /// an edge: true on every tick where probes pass. The probe loop combines
+    /// it with the pod's current state to decide the Booting → Running transition.
     pub all_probes_passing: bool,
     /// True if a probe failed this tick (for event emission).
     pub probe_failed: bool,

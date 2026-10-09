@@ -144,6 +144,8 @@ pub struct WorkloadManager {
     delegated_key_ttl_secs: u64,
     /// Optional event reporter for pod lifecycle events.
     event_reporter: Option<Arc<crate::observability::pod_events::PodEventReporter>>,
+    /// Per-pod probe runners (Phase 8.1).
+    probes: Option<Arc<RwLock<probe_manager::ProbeManager>>>,
 }
 
 impl WorkloadManager {
@@ -174,6 +176,7 @@ impl WorkloadManager {
             node_spiffe_id: None,
             delegated_key_ttl_secs: crate::identity::degraded::DEFAULT_DELEGATED_KEY_TTL_SECS,
             event_reporter: None,
+            probes: None,
         }
     }
 
@@ -222,6 +225,12 @@ impl WorkloadManager {
         self.delegated_keys = Some(delegated_keys);
         self.node_spiffe_id = Some(node_spiffe_id);
         self.delegated_key_ttl_secs = delegated_key_ttl_secs;
+        self
+    }
+
+    /// Attach the probe manager (Phase 8.1).
+    pub fn with_probes(mut self, probe_manager: Arc<RwLock<probe_manager::ProbeManager>>) -> Self {
+        self.probes = Some(probe_manager);
         self
     }
 
@@ -339,6 +348,14 @@ impl WorkloadManager {
                 .insert(pod_id.clone(), ho.0);
         }
         self.pod_manager.write().await.add_pod(pod);
+
+        // Phase 8.1: register a probe runner for this pod.
+        if let Some(probe_mgr) = &self.probes {
+            let runner = probes::ProbeSetRunner::new(
+                spec.pod_spec.as_ref().and_then(|ps| ps.probes.as_ref()),
+            );
+            probe_mgr.write().await.register_pod(&pod_id, runner);
+        }
         Ok(handle)
     }
 
@@ -433,6 +450,17 @@ impl WorkloadManager {
             let grace = 30; // Default grace; refine from TerminationSpec in Phase 5.
             (pod.runtime, pod.pid.unwrap_or(0), grace)
         };
+
+        // Phase 8.1: transition to Terminating and unregister probes.
+        {
+            let mut pm = self.pod_manager.write().await;
+            if let Some(pod) = pm.get_pod_mut(pod_id) {
+                pod.begin_eviction();
+            }
+        }
+        if let Some(probe_mgr) = &self.probes {
+            probe_mgr.write().await.unregister_pod(pod_id);
+        }
 
         if let Some(ref event_reporter) = self.event_reporter {
             if let Err(e) = event_reporter

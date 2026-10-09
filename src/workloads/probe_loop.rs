@@ -102,7 +102,6 @@ impl ProbeLoop {
         let mut emit_back_off = false;
         let mut emit_probe_failed = false;
 
-        // Phase 1: mutate pod state under the lock, decide which events to emit.
         {
             let mut pm = self.pod_manager.write().await;
             let Some(pod) = pm.get_pod_mut(&pod_id) else {
@@ -110,22 +109,23 @@ impl ProbeLoop {
             };
 
             let was_running = pod.state == PodState::Running;
-
-            // Threshold-aware: a pod only goes dead after failure_threshold
-            // consecutive liveness failures (prevents replacement storms).
             pod.probe_live = result.live;
             pod.probe_ready = result.ready;
 
-            // Edge-triggered ProbeFailed: emit once when a probe transitions
-            // from passing to failing, not on every red tick. The flag is
-            // cleared when probes recover, so a new failure episode re-emits.
-            if result.probe_failed {
-                if !pod.probe_failure_reported {
-                    pod.probe_failure_reported = true;
-                    emit_probe_failed = true;
-                }
-            } else {
-                // Probes recovered; allow re-emission on the next failure episode.
+            // Track whether the pod has ever been observed all-passing.
+            // This gates ProbeFailed emission to suppress startup noise.
+            if result.all_probes_passing {
+                pod.probe_ever_passed = true;
+            }
+
+            // Startup-suppressed ProbeFailed: emit only if the pod has been
+            // observed passing at least once. A pod that has never been
+            // healthy failing during initial startup is not surfaced.
+            if result.probe_failed && pod.probe_ever_passed && !pod.probe_failure_reported {
+                pod.probe_failure_reported = true;
+                emit_probe_failed = true;
+            } else if !result.probe_failed {
+                // Recovered; allow re-emission on a future failure episode.
                 pod.probe_failure_reported = false;
             }
 
@@ -145,6 +145,8 @@ impl ProbeLoop {
                         } else {
                             pod.increment_restart();
                             pod.transition_to(PodState::Booting);
+                            // Fresh failure episode after restart.
+                            pod.probe_failure_reported = false;
                         }
                     }
                     RestartPolicy::Never => {
@@ -154,7 +156,6 @@ impl ProbeLoop {
             }
         } // pod_manager write lock released here, BEFORE any network await
 
-        // Phase 2: emit events without holding the lock.
         if emit_probe_failed {
             self.emit_probe_failed(&pod_id).await;
         }
@@ -342,5 +343,58 @@ mod tests {
                 .unwrap()
                 .probe_failure_reported
         );
+    }
+
+    #[tokio::test]
+    async fn probe_failed_suppressed_before_first_pass() {
+        let probe_mgr = Arc::new(RwLock::new(
+            crate::workloads::probe_manager::ProbeManager::new(),
+        ));
+        let pod_mgr = Arc::new(RwLock::new(PodManager::new()));
+        {
+            let mut pm = pod_mgr.write().await;
+            pm.add_pod(make_pod("pod-1", PodState::Booting));
+        }
+        let loop_ = ProbeLoop::new(probe_mgr, pod_mgr.clone(), None, ProbeLoopConfig::default());
+        loop_
+            .process_probe_result(ProbeTickResult {
+                pod_id: "pod-1".to_string(),
+                live: true,
+                ready: false,
+                all_probes_passing: false,
+                probe_failed: true,
+            })
+            .await;
+        // Never passed -> ProbeFailed suppressed (probe_failure_reported stays false).
+        let pm = pod_mgr.read().await;
+        let pod = pm.get_pod("pod-1").unwrap();
+        assert!(!pod.probe_failure_reported);
+        assert!(!pod.probe_ever_passed);
+    }
+
+    #[tokio::test]
+    async fn probe_failed_emitted_after_first_pass() {
+        let probe_mgr = Arc::new(RwLock::new(
+            crate::workloads::probe_manager::ProbeManager::new(),
+        ));
+        let pod_mgr = Arc::new(RwLock::new(PodManager::new()));
+        {
+            let mut pm = pod_mgr.write().await;
+            let mut pod = make_pod("pod-1", PodState::Booting);
+            pod.probe_ever_passed = true; // has been healthy before
+            pm.add_pod(pod);
+        }
+        let loop_ = ProbeLoop::new(probe_mgr, pod_mgr.clone(), None, ProbeLoopConfig::default());
+        loop_
+            .process_probe_result(ProbeTickResult {
+                pod_id: "pod-1".to_string(),
+                live: true,
+                ready: false,
+                all_probes_passing: false,
+                probe_failed: true,
+            })
+            .await;
+        let pm = pod_mgr.read().await;
+        assert!(pm.get_pod("pod-1").unwrap().probe_failure_reported);
     }
 }

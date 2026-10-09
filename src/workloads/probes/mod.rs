@@ -177,12 +177,21 @@ pub struct ProbeSetRunner {
 
 impl ProbeSetRunner {
     /// Create from a proto ProbeSet.
+    ///
+    /// A `None` probe set means "no probes configured": all probes report
+    /// passing, so the pod is immediately live + ready.
     pub fn new(probes: Option<&ProbeSet>) -> Self {
-        let probes = probes.unwrap();
-        Self {
-            startup: probes.startup.as_ref().map(ProbeRunner::new),
-            liveness: probes.liveness.as_ref().map(ProbeRunner::new),
-            readiness: probes.readiness.as_ref().map(ProbeRunner::new),
+        match probes {
+            Some(p) => Self {
+                startup: p.startup.as_ref().map(ProbeRunner::new),
+                liveness: p.liveness.as_ref().map(ProbeRunner::new),
+                readiness: p.readiness.as_ref().map(ProbeRunner::new),
+            },
+            None => Self {
+                startup: None,
+                liveness: None,
+                readiness: None,
+            },
         }
     }
 
