@@ -25,6 +25,7 @@ use bytemuck;
 use fleetos_core::proto::fleetos::workload_status_service_client::WorkloadStatusServiceClient;
 use fleetos_core::proto::state::PodMetrics;
 use fleetos_ebpf_common::PodNetCounters;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tonic::transport::Channel;
@@ -154,7 +155,7 @@ impl PodNetCountersReader {
 /// The containerd proxy accounting is tracked separately by the agent.
 pub struct CountersReporter {
     reader: PodNetCountersReader,
-    map: aya::maps::PerCpuHashMap<aya::maps::MapData, u32, [u64; 4]>,
+    ebpf_manager: Arc<std::sync::Mutex<crate::ebpf::EbpfManager>>,
     client: WorkloadStatusServiceClient<Channel>,
     interval: Duration,
     /// Containerd proxy accounting: pod_id -> (tx_bytes, rx_bytes).
@@ -164,13 +165,13 @@ pub struct CountersReporter {
 
 impl CountersReporter {
     pub fn new(
-        map: aya::maps::PerCpuHashMap<aya::maps::MapData, u32, [u64; 4]>,
+        ebpf_manager: Arc<std::sync::Mutex<crate::ebpf::EbpfManager>>,
         client: WorkloadStatusServiceClient<Channel>,
         interval: Duration,
     ) -> Self {
         Self {
             reader: PodNetCountersReader::new(),
-            map,
+            ebpf_manager,
             client,
             interval,
             containerd_accounting: std::collections::HashMap::new(),
@@ -218,9 +219,13 @@ impl CountersReporter {
         &mut self,
         interval_secs: u64,
     ) -> Result<(), crate::error::AgentError> {
-        let rates = self
-            .reader
-            .read_and_compute_rates(&mut self.map, interval_secs)?;
+        let rates = {
+            let mut mgr = self.ebpf_manager.lock().map_err(|e| {
+                crate::error::AgentError::Ebpf(format!("EbpfManager lock poisoned: {}", e))
+            })?;
+            self.reader
+                .read_and_compute_rates(&mut mgr.pod_net_counters, interval_secs)?
+        };
 
         let window_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

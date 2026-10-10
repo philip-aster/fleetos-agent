@@ -177,17 +177,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fleetos_agent::ebpf::events::take_flow_events_ringbuf(&mut ebpf_manager.ebpf)?;
     tracing::info!("FLOW_EVENTS ring buffer acquired");
 
-    // Take the POD_NET_COUNTERS map for counters reporting.
-    let pod_net_counters_map =
-        fleetos_agent::ebpf::maps::pod_net_counters_map(&mut ebpf_manager.ebpf)?;
-    tracing::info!("POD_NET_COUNTERS map acquired");
-
     // Wrap for shared access (NetGuard needs &mut Ebpf for TC attach at VM boot).
     let ebpf_manager = std::sync::Arc::new(std::sync::Mutex::new(ebpf_manager));
 
     // --- Phase 7: Shared state ---
     let pod_manager = Arc::new(RwLock::new(PodManager::new()));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // --- Phase 8.1: Probe execution ---
+    let probe_manager = Arc::new(RwLock::new(
+        fleetos_agent::workloads::probe_manager::ProbeManager::new(),
+    ));
+
+    // --- Phase 8.2: VSOCK attestation server (created before WorkloadManager
+    // so the registrar can be injected). ---
+    let verifier = Arc::new(VsockQuoteVerifier::new());
+    let config_builder = Arc::new(WorkloadConfigBuilder::new(
+        config.node.trust_domain.clone(),
+        delegated_keys.clone(),
+        config.svid.workload_ttl_secs,
+    ));
+    let vsock_server = Arc::new(VsockAttestServer::new(verifier, config_builder.clone()));
 
     // --- Runtime adapters + orchestration ---
     let containerd_adapter = std::sync::Arc::new(
@@ -205,30 +215,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fleetos_agent::workloads::NodeIpAllocator::new(&config.networking.workload_ip_cidr)?,
     ));
 
-    // --- Phase 8.1: Probe execution ---
-    let probe_manager = Arc::new(RwLock::new(
-        fleetos_agent::workloads::probe_manager::ProbeManager::new(),
-    ));
+    // Phase 8.2: build WorkloadManager with attestation registrar + eBPF manager.
+    let mut wm_builder = fleetos_agent::workloads::WorkloadManager::new(
+        containerd_adapter.clone(),
+        volume_config,
+        pod_manager.clone(),
+        net_guard,
+        config.node.trust_domain.clone(),
+        src_identity,
+        ip_allocator,
+        config.images.cache_path.clone(),
+    )
+    .with_delegation(
+        control_client.clone(),
+        delegated_keys.clone(),
+        node_spiffe_id.clone(),
+        config.svid.delegated_key_ttl_secs,
+    )
+    .with_probes(probe_manager.clone())
+    .with_attestation(vsock_server.clone())
+    .with_ebpf_manager(ebpf_manager.clone());
+    if let Some(ref kp) = config.vsock_attest.kernel_path {
+        let gi = config
+            .vsock_attest
+            .guest_init_path
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/fleetos/fleetos-guest-init"));
+        wm_builder = wm_builder.with_boot_artifact_paths(kp.clone(), gi);
+    }
+    let workload_manager = std::sync::Arc::new(wm_builder);
 
-    let workload_manager = std::sync::Arc::new(
-        fleetos_agent::workloads::WorkloadManager::new(
-            containerd_adapter.clone(),
-            volume_config,
-            pod_manager.clone(),
-            net_guard,
-            config.node.trust_domain.clone(),
-            src_identity,
-            ip_allocator,
-            config.images.cache_path.clone(),
-        )
-        .with_delegation(
-            control_client.clone(),
-            delegated_keys.clone(),
-            node_spiffe_id.clone(),
-            config.svid.delegated_key_ttl_secs,
-        )
-        .with_probes(probe_manager.clone()),
-    );
+    // VSOCK attestation server (created above; spawn the accept loop).
+    let vsock_server_run = vsock_server.clone();
+    let vsock_shutdown_rx = shutdown_rx.clone();
+    let vsock_handle = tokio::spawn(async move {
+        if let Err(e) = vsock_server_run.run(vsock_shutdown_rx).await {
+            tracing::error!(error = %e, "VSOCK attestation server failed");
+        }
+    });
+    tracing::info!("VSOCK attestation server started");
 
     // Create the reporter once, behind an Arc.
     let pod_event_client = control_client.pod_event_client().await?;
@@ -271,22 +296,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keystore.clone(),
         svid_state_lock.clone(),
     ));
-
-    // --- Phase 8: VSOCK attestation server ---
-    let verifier = Arc::new(VsockQuoteVerifier::new());
-    let config_builder = Arc::new(WorkloadConfigBuilder::new(
-        config.node.trust_domain.clone(),
-        delegated_keys.clone(),
-        config.svid.workload_ttl_secs,
-    ));
-    let vsock_server = VsockAttestServer::new(verifier, config_builder.clone());
-    let vsock_shutdown_rx = shutdown_rx.clone();
-    let vsock_handle = tokio::spawn(async move {
-        if let Err(e) = vsock_server.run(vsock_shutdown_rx).await {
-            tracing::error!(error = %e, "VSOCK attestation server failed");
-        }
-    });
-    tracing::info!("VSOCK attestation server started");
 
     // --- Phase 9: Status reporter ---
     let status_client = control_client.workload_status_client().await?;
@@ -361,7 +370,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Phase 11: Counters reporter ---
     let counters_client = control_client.workload_status_client().await?;
     let counters_reporter = fleetos_agent::ebpf::counters::CountersReporter::new(
-        pod_net_counters_map,
+        ebpf_manager.clone(),
         counters_client,
         Duration::from_secs(30),
     );

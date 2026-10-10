@@ -1033,3 +1033,112 @@ async fn microvm_boot_rejects_hostpath_before_any_sdk_call() {
         .unwrap_err();
     assert!(err.to_string().contains("hostPath"));
 }
+
+// --- Phase 8.2: attestation registration ---
+#[derive(Default)]
+struct MockAttestationRegistrar {
+    registered_measurements: std::sync::Mutex<Vec<u32>>,
+    registered_contexts: std::sync::Mutex<Vec<u32>>,
+    unregistered: std::sync::Mutex<Vec<u32>>,
+}
+impl fleetos_agent::vsock_attest::AttestationRegistrar for MockAttestationRegistrar {
+    fn register_boot_measurement(
+        &self,
+        cid: u32,
+        _m: fleetos_agent::vsock_attest::measure::BootMeasurement,
+    ) {
+        self.registered_measurements.lock().unwrap().push(cid);
+    }
+    fn register_workload_context(
+        &self,
+        cid: u32,
+        _c: fleetos_agent::vsock_attest::WorkloadContext,
+    ) {
+        self.registered_contexts.lock().unwrap().push(cid);
+    }
+    fn unregister_boot_measurement(&self, cid: u32) {
+        self.unregistered.lock().unwrap().push(cid);
+    }
+    fn unregister_workload_context(&self, cid: u32) {
+        self.unregistered.lock().unwrap().push(cid);
+    }
+}
+
+#[test]
+fn microvm_pair_allocation_is_30_aligned_and_unique() {
+    let mut a = NodeIpAllocator::new("172.30.0.0/24").unwrap();
+    let (gw1, guest1) = a.allocate_microvm_pair("p1").unwrap();
+    let (gw2, guest2) = a.allocate_microvm_pair("p2").unwrap();
+    // Each pair occupies its own /30: guest = gateway + 1.
+    assert_eq!(guest1, gw1 + 1);
+    assert_eq!(guest2, gw2 + 1);
+    // Distinct /30s don't overlap.
+    assert_ne!(gw1, gw2);
+    assert_ne!(guest1, guest2);
+    assert_ne!(guest1, gw2);
+    // Gateway offset is ≡ 1 (mod 4) relative to the base.
+    assert_eq!((gw1 - 0xAC1E0000) % 4, 1);
+    // Release returns the pair to the free pool.
+    a.release_microvm_pair("p1");
+    let (gw3, _g) = a.allocate_microvm_pair("p3").unwrap();
+    assert_eq!(gw3, gw1); // reused from free list
+}
+
+#[tokio::test]
+async fn boot_microvm_registers_attestation_and_cleans_up_on_failure() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let registrar = Arc::new(MockAttestationRegistrar::default());
+    let guard = Arc::new(MockNetGuard::new(false));
+    let containerd = Arc::new(ContainerdAdapter::new_lazy("fleetos", String::new()));
+    let pod_manager = Arc::new(tokio::sync::RwLock::new(PodManager::new()));
+    let ip_alloc = Arc::new(std::sync::Mutex::new(
+        NodeIpAllocator::new("172.30.0.0/16").unwrap(),
+    ));
+
+    // Create ALL boot artifacts so compute_boot_measurement succeeds and the
+    // boot reaches the attestation-registration step. The boot then fails at
+    // adapter.boot (no real Cloud Hypervisor), exercising the cleanup path.
+    let kernel_path = tempdir.path().join("vmlinux");
+    let guest_init_path = tempdir.path().join("fleetos-guest-init");
+    std::fs::write(&kernel_path, b"kernel").unwrap();
+    std::fs::write(&guest_init_path, b"guest-init").unwrap();
+    // Rootfs at the exact path oci_to_erofs returns for image "test-image".
+    let image_cache = tempdir.path().join("images");
+    std::fs::create_dir_all(&image_cache).unwrap();
+    std::fs::write(image_cache.join("test-image.erofs"), b"rootfs").unwrap();
+
+    let wm = WorkloadManager::new(
+        containerd,
+        VolumeConfig {
+            scratch_root: tempdir.path().to_path_buf(),
+            allow_host_path: false,
+        },
+        pod_manager.clone(),
+        Some(guard.clone()),
+        "test.internal".to_string(),
+        None, // no src_identity: skip SRC_IDENTITY registration
+        ip_alloc.clone(),
+        image_cache.clone(),
+    )
+    .with_attestation(registrar.clone())
+    .with_boot_artifact_paths(kernel_path, guest_init_path);
+
+    let spec = make_spec("web", RuntimeKind::CloudHypervisor);
+    // Boot fails at adapter.boot (no real CH), after registration.
+    let _ = wm.reconcile(&[spec]).await;
+
+    // Registration must have actually happened (boot reached the attestation step).
+    let reg_m = registrar.registered_measurements.lock().unwrap().len();
+    let reg_c = registrar.registered_contexts.lock().unwrap().len();
+    assert!(reg_m > 0, "boot measurement must have been registered");
+    assert!(reg_c > 0, "workload context must have been registered");
+
+    // Every registration must be cleaned up on the failed boot. `unregistered`
+    // counts both measurement and context unregistrations, so compare totals.
+    let unreg = registrar.unregistered.lock().unwrap().len();
+    assert_eq!(
+        reg_m + reg_c,
+        unreg,
+        "all attestation registrations must be unregistered on failed boot"
+    );
+}

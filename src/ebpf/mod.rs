@@ -38,6 +38,10 @@ pub struct EbpfManager {
     /// Taken once in `load()`; accessed under the `Arc<Mutex<>>` lock by
     /// `VmNetGuardAdapter`'s `SrcIdentityRegistry` impl.
     pub src_identity_map: HashMap<aya::maps::MapData, u32, [u8; 16]>,
+    /// Phase 8.2.6: POD_NET_COUNTERS kept in the manager so both the
+    /// CountersReporter (read) and WorkloadManager (pre-populate at boot)
+    /// can share it via Arc<Mutex<EbpfManager>>.
+    pub pod_net_counters: aya::maps::PerCpuHashMap<aya::maps::MapData, u32, [u64; 4]>,
 }
 
 impl EbpfManager {
@@ -54,6 +58,7 @@ impl EbpfManager {
         let dummy_ip_route = maps::dummy_ip_route_map(&mut ebpf)?;
         let local_workloads = maps::local_workloads_map(&mut ebpf)?;
         let src_identity_map = maps::src_identity_map(&mut ebpf)?;
+        let pod_net_counters = maps::pod_net_counters_map(&mut ebpf)?;
         Ok(Self {
             ebpf,
             config: config.clone(),
@@ -63,6 +68,7 @@ impl EbpfManager {
             dummy_ip_route,
             local_workloads,
             src_identity_map,
+            pod_net_counters,
         })
     }
     // ... attach_nodewide_cgroup_programs and check_map_capacity unchanged ...

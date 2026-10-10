@@ -146,6 +146,13 @@ pub struct WorkloadManager {
     event_reporter: Option<Arc<crate::observability::pod_events::PodEventReporter>>,
     /// Per-pod probe runners (Phase 8.1).
     probes: Option<Arc<RwLock<probe_manager::ProbeManager>>>,
+    /// Phase 8.2: attestation registrar (VsockAttestServer behind a trait seam).
+    attestation: Option<Arc<dyn crate::vsock_attest::AttestationRegistrar>>,
+    /// Phase 8.2: shared eBPF manager for POD_NET_COUNTERS pre-population.
+    ebpf_manager: Option<Arc<std::sync::Mutex<crate::ebpf::EbpfManager>>>,
+    /// Phase 8.2: boot artifact paths for the host-measured boot measurement.
+    kernel_path: std::path::PathBuf,
+    guest_init_path: std::path::PathBuf,
 }
 
 impl WorkloadManager {
@@ -177,6 +184,10 @@ impl WorkloadManager {
             delegated_key_ttl_secs: crate::identity::degraded::DEFAULT_DELEGATED_KEY_TTL_SECS,
             event_reporter: None,
             probes: None,
+            attestation: None,
+            ebpf_manager: None,
+            kernel_path: std::path::PathBuf::from("/var/lib/fleetos/vmlinux"),
+            guest_init_path: std::path::PathBuf::from("/var/lib/fleetos/fleetos-guest-init"),
         }
     }
 
@@ -225,6 +236,36 @@ impl WorkloadManager {
         self.delegated_keys = Some(delegated_keys);
         self.node_spiffe_id = Some(node_spiffe_id);
         self.delegated_key_ttl_secs = delegated_key_ttl_secs;
+        self
+    }
+
+    /// Phase 8.2: attach the attestation registrar (VsockAttestServer).
+    pub fn with_attestation(
+        mut self,
+        registrar: Arc<dyn crate::vsock_attest::AttestationRegistrar>,
+    ) -> Self {
+        self.attestation = Some(registrar);
+        self
+    }
+
+    /// Phase 8.2: attach the shared eBPF manager (for counters pre-population).
+    pub fn with_ebpf_manager(
+        mut self,
+        ebpf_manager: Arc<std::sync::Mutex<crate::ebpf::EbpfManager>>,
+    ) -> Self {
+        self.ebpf_manager = Some(ebpf_manager);
+        self
+    }
+
+    /// Phase 8.2: override boot artifact paths (kernel + guest-init) used for
+    /// the host-measured boot measurement.
+    pub fn with_boot_artifact_paths(
+        mut self,
+        kernel_path: std::path::PathBuf,
+        guest_init_path: std::path::PathBuf,
+    ) -> Self {
+        self.kernel_path = kernel_path;
+        self.guest_init_path = guest_init_path;
         self
     }
 
@@ -294,36 +335,52 @@ impl WorkloadManager {
             }
         }
 
-        // 7.2.5 (Option B): MicroVM gets an agent-assigned node-local source IP,
-        // registered in SRC_IDENTITY_MAP before boot so the guest's first packet
-        // is attributable (fail-closed otherwise). Containerd IP discovery is a
-        // follow-up (runtime assigns the IP post-start).
+        // 7.2.5 (Option B) + 8.2.4: MicroVM gets an agent-assigned /30 pair.
+        // The guest IP is registered in SRC_IDENTITY_MAP before boot so the
+        // guest's first packet is attributable (fail-closed otherwise).
         let mut registered_ip: Option<HostOrderIpv4> = None;
+        let mut microvm_ips: Option<(u32, u32)> = None; // (gateway, guest)
         if spec.runtime == RuntimeKind::CloudHypervisor {
+            let (gw_ip, guest_ip) = self
+                .ip_allocator
+                .lock()
+                .unwrap()
+                .allocate_microvm_pair(&pod_id)?;
             if let Some(registry) = &self.src_identity {
-                let src_ip = self.ip_allocator.lock().unwrap().allocate(&pod_id)?;
-                let ho = HostOrderIpv4(src_ip);
+                let ho = HostOrderIpv4(guest_ip);
                 if let Err(e) = registry.register(ho, &fp) {
-                    self.ip_allocator.lock().unwrap().release(&pod_id);
+                    self.ip_allocator
+                        .lock()
+                        .unwrap()
+                        .release_microvm_pair(&pod_id);
                     return Err(e);
                 }
                 registered_ip = Some(ho);
-                // TODO(7.7): feed src_ip into WorkloadContext.guest_ip for guest-init.
             }
+            microvm_ips = Some((gw_ip, guest_ip));
         }
 
         let boot_result = match spec.runtime {
             RuntimeKind::Containerd => self.boot_containerd(spec, &mounts).await,
-            RuntimeKind::CloudHypervisor => self.boot_microvm(spec, &mounts).await,
+            RuntimeKind::CloudHypervisor => {
+                let (gw_ip, guest_ip) = microvm_ips
+                    .ok_or_else(|| AgentError::Workload("missing MicroVM IPs".into()))?;
+                self.boot_microvm(spec, &mounts, guest_ip, gw_ip).await
+            }
         };
 
         let handle = match boot_result {
             Ok(h) => h,
             Err(e) => {
-                // Boot failed: release the registered identity + IP (no leak).
+                // Boot failed: release the registered identity + IP pair (no leak).
                 if let (Some(registry), Some(ho)) = (&self.src_identity, registered_ip) {
                     let _ = registry.unregister(ho);
-                    self.ip_allocator.lock().unwrap().release(&pod_id);
+                }
+                if spec.runtime == RuntimeKind::CloudHypervisor && microvm_ips.is_some() {
+                    self.ip_allocator
+                        .lock()
+                        .unwrap()
+                        .release_microvm_pair(&pod_id);
                 }
                 return Err(e);
             }
@@ -371,73 +428,123 @@ impl WorkloadManager {
         &self,
         spec: &WorkloadSpec,
         mounts: &[PreparedMount],
+        guest_ip: u32,
+        gateway_ip: u32,
     ) -> Result<u32, AgentError> {
-        // Fail-closed before side effects (CID allocation, NetGuard arm):
-        // reject mounts this runtime cannot honor.
+        // Fail-closed before side effects: reject mounts this runtime cannot honor.
         microvm::validate_microvm_mounts(mounts)?;
 
         // Allocate a VSOCK CID for this MicroVM.
         let vsock_cid = self.cid_allocator.write().await.allocate();
         let interface = format!("vmtap{}", vsock_cid);
 
-        // Capture the guard so we can disarm it on failure
         let guard = match &self.net_guard {
             Some(guard) => guard,
             None => {
                 return Err(AgentError::Workload(
-                       "boot aborted: NetGuard (VmNetGuard) not armed before MicroVM boot (fail-closed)".into(),
-                   ));
+                    "boot aborted: NetGuard (VmNetGuard) not armed before MicroVM boot (fail-closed)"
+                        .into(),
+                ));
             }
         };
 
         // BOOT-RACE GUARD (non-negotiable): arm BEFORE the VM boots / TAP comes up.
         guard.arm(&interface)?;
 
-        // 7.8.1: Wrap the rest of the boot sequence so we can disarm NetGuard
-        // if ANY step fails before the VM is successfully running.
-        let result = async {
-            // Create + boot the MicroVM adapter.
-            let api_socket = format!("/run/fleetos/vm/{}/api.sock", vsock_cid);
-            let adapter = Arc::new(MicroVmAdapter::new(&api_socket)?);
-
-            // Phase 7.7.3: Resolve OCI image to erofs rootfs path.
-            let rootfs_path =
-                crate::workloads::image::oci_to_erofs(&spec.image, &self.image_cache_path)?;
-            let rootfs_path_str = rootfs_path.to_string_lossy().to_string();
-
-            // Derive a gateway IP for the TAP interface (/30 point-to-point link).
-            let gateway_ip = std::net::Ipv4Addr::new(
-                10,
-                0,
-                (vsock_cid / 256) as u8,
-                ((vsock_cid % 256) * 4) as u8,
-            );
-
-            // Pass the TAP interface name and the gateway IP to the MicroVM adapter
-            let handle = adapter
-                .boot(
-                    spec,
-                    vsock_cid,
-                    mounts,
-                    &rootfs_path_str,
-                    &interface,
-                    gateway_ip,
-                )
-                .await?;
-
-            self.microvms.write().await.insert(vsock_cid, adapter);
-            Ok::<u32, AgentError>(handle)
-        }
-        .await;
-
+        // 7.8.1 + 8.2.7/8.2.8: wrap the boot so we clean up (disarm NetGuard,
+        // unregister attestation) if ANY step fails before the VM runs.
+        let result = self
+            .boot_microvm_inner(spec, mounts, vsock_cid, &interface, guest_ip, gateway_ip)
+            .await;
         match result {
             Ok(handle) => Ok(handle),
             Err(e) => {
-                tracing::error!(vsock_cid, error = %e, "MicroVM boot failed, disarming NetGuard to prevent double-attach on retry");
+                tracing::error!(
+                    vsock_cid,
+                    error = %e,
+                    "MicroVM boot failed; disarming NetGuard + unregistering attestation"
+                );
+                if let Some(reg) = &self.attestation {
+                    reg.unregister_boot_measurement(vsock_cid);
+                    reg.unregister_workload_context(vsock_cid);
+                }
                 let _ = guard.disarm(&interface);
                 Err(e)
             }
         }
+    }
+
+    async fn boot_microvm_inner(
+        &self,
+        spec: &WorkloadSpec,
+        mounts: &[PreparedMount],
+        vsock_cid: u32,
+        interface: &str,
+        guest_ip: u32,
+        gateway_ip: u32,
+    ) -> Result<u32, AgentError> {
+        // Create + boot the MicroVM adapter.
+        let api_socket = format!("/run/fleetos/vm/{}/api.sock", vsock_cid);
+        let adapter = Arc::new(MicroVmAdapter::new(&api_socket)?);
+
+        // Phase 7.7.3: Resolve OCI image to erofs rootfs path.
+        let rootfs_path =
+            crate::workloads::image::oci_to_erofs(&spec.image, &self.image_cache_path)?;
+        let rootfs_path_str = rootfs_path.to_string_lossy().to_string();
+
+        // 8.2.2: Compute the boot measurement over kernel + rootfs + guest-init.
+        let measurement = crate::vsock_attest::measure::compute_boot_measurement(
+            &self.kernel_path,
+            &rootfs_path,
+            &self.guest_init_path,
+        )?;
+
+        // 8.2.3 + 8.2.4: Build the workload context, feeding the allocated
+        // guest IP so guest-init gets real networking (resolves TODO 7.7).
+        let context = crate::vsock_attest::WorkloadContext {
+            pod_spec: spec.pod_spec.clone().unwrap_or_default(),
+            guest_ip: guest_ip.to_be_bytes(),
+            netmask: [255, 255, 255, 252], // /30 point-to-point
+            gateway: gateway_ip.to_be_bytes(),
+        };
+
+        // 8.2.2/8.2.3: Register measurement + context BEFORE boot so the guest
+        // can attest immediately. Warn (not fail) if no registrar is wired so
+        // existing net-guard tests still exercise the boot path.
+        if let Some(reg) = &self.attestation {
+            reg.register_boot_measurement(vsock_cid, measurement);
+            reg.register_workload_context(vsock_cid, context);
+        } else {
+            tracing::warn!(
+                vsock_cid,
+                "no attestation registrar configured; MicroVM attestation will fail"
+            );
+        }
+
+        // 8.2.6: Pre-populate POD_NET_COUNTERS for the guest source IP so net
+        // metrics aren't always zero (resolves audit A5).
+        if let Some(ebpf) = &self.ebpf_manager {
+            if let Ok(mut mgr) = ebpf.lock() {
+                let _ = crate::ebpf::maps::prepopulate_pod_counters(
+                    &mut mgr.pod_net_counters,
+                    HostOrderIpv4(guest_ip),
+                );
+            }
+        }
+
+        let gateway_ip_addr = std::net::Ipv4Addr::from(gateway_ip.to_be_bytes());
+        let handle = adapter
+            .boot(
+                spec,
+                vsock_cid,
+                mounts,
+                &rootfs_path_str,
+                interface,
+                gateway_ip_addr,
+            )
+            .await?;
+        self.microvms.write().await.insert(vsock_cid, adapter);
+        Ok(handle)
     }
 
     /// Evict a pod: stop via the right adapter, tear down scratch, remove record.
@@ -483,17 +590,29 @@ impl WorkloadManager {
                         let _ = guard.disarm(&interface);
                     }
                 }
+                // 8.2.8: unregister attestation material for this CID.
+                if let Some(reg) = &self.attestation {
+                    reg.unregister_boot_measurement(handle as u32);
+                    reg.unregister_workload_context(handle as u32);
+                }
             }
         }
 
-        // 7.2.5: unregister source identity + release node-local IP.
+        // 7.2.5: unregister source identity + release the /30 IP pair.
         if let Some(src_ip) = self.pod_source_ips.lock().unwrap().remove(pod_id) {
             if let Some(registry) = &self.src_identity {
                 if let Err(e) = registry.unregister(HostOrderIpv4(src_ip)) {
                     tracing::warn!(pod_id, error = %e, "SRC_IDENTITY_MAP unregister failed");
                 }
             }
-            self.ip_allocator.lock().unwrap().release(pod_id);
+            if runtime == RuntimeKind::CloudHypervisor {
+                self.ip_allocator
+                    .lock()
+                    .unwrap()
+                    .release_microvm_pair(pod_id);
+            } else {
+                self.ip_allocator.lock().unwrap().release(pod_id);
+            }
         }
 
         // Tear down per-pod EmptyDir scratch.
@@ -626,6 +745,60 @@ impl NodeIpAllocator {
 
     pub fn allocated_count(&self) -> usize {
         self.allocated.len()
+    }
+
+    /// Allocate a /30-aligned point-to-point pair (gateway + guest) for a MicroVM.
+    /// Returns `(gateway_ip, guest_ip)` in canonical (big-endian numeric) form.
+    ///
+    /// Reuses a freed /30-aligned pair when one is available; otherwise advances
+    /// `next_offset` to the next /30 boundary. The gateway sits at offset ≡ 1 (mod 4),
+    /// the guest at the following offset; the other two offsets of the /30 are reserved.
+    pub fn allocate_microvm_pair(&mut self, pod_id: &str) -> Result<(u32, u32), AgentError> {
+        // Try to reuse a freed /30-aligned pair: both offsets free, first ≡ 1 (mod 4).
+        let mut candidates: Vec<u32> = self.free.iter().copied().collect();
+        candidates.sort_unstable();
+        let mut reuse: Option<u32> = None;
+        for &o in &candidates {
+            if o % 4 == 1 && self.free.contains(&(o + 1)) {
+                reuse = Some(o);
+                break;
+            }
+        }
+        if let Some(o) = reuse {
+            self.free.remove(&o);
+            self.free.remove(&(o + 1));
+            self.allocated.insert(o, format!("{}:gw", pod_id));
+            self.allocated.insert(o + 1, pod_id.to_string());
+            return Ok((self.base + o, self.base + o + 1));
+        }
+
+        // No reusable pair; advance to the next /30 boundary.
+        let mut o = self.next_offset;
+        while o % 4 != 1 {
+            o += 1;
+        }
+        if o + 1 >= self.host_count - 1 {
+            return Err(AgentError::Workload(
+                "node workload IP space exhausted".into(),
+            ));
+        }
+        let gw_offset = o;
+        let guest_offset = o + 1;
+        self.next_offset = o + 4;
+        self.allocated.insert(gw_offset, format!("{}:gw", pod_id));
+        self.allocated.insert(guest_offset, pod_id.to_string());
+        Ok((self.base + gw_offset, self.base + guest_offset))
+    }
+
+    /// Release both IPs of a MicroVM /30 pair.
+    pub fn release_microvm_pair(&mut self, pod_id: &str) {
+        self.allocated.retain(|offset, pid| {
+            let belongs = pid == pod_id || *pid == format!("{}:gw", pod_id);
+            if belongs {
+                self.free.insert(*offset);
+            }
+            !belongs
+        });
     }
 }
 

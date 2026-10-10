@@ -172,6 +172,31 @@ impl VsockAttestServer {
     }
 }
 
+/// Trait seam so the workload layer can register attestation material without
+/// importing VSOCK internals. Implemented by `VsockAttestServer`; injected
+/// into `WorkloadManager` as `Arc<dyn AttestationRegistrar>`.
+pub trait AttestationRegistrar: Send + Sync {
+    fn register_boot_measurement(&self, cid: u32, measurement: BootMeasurement);
+    fn register_workload_context(&self, cid: u32, context: WorkloadContext);
+    fn unregister_boot_measurement(&self, cid: u32);
+    fn unregister_workload_context(&self, cid: u32);
+}
+
+impl AttestationRegistrar for VsockAttestServer {
+    fn register_boot_measurement(&self, cid: u32, measurement: BootMeasurement) {
+        self.boot_measurements.write().insert(cid, measurement);
+    }
+    fn register_workload_context(&self, cid: u32, context: WorkloadContext) {
+        self.workload_contexts.write().insert(cid, context);
+    }
+    fn unregister_boot_measurement(&self, cid: u32) {
+        self.boot_measurements.write().remove(&cid);
+    }
+    fn unregister_workload_context(&self, cid: u32) {
+        self.workload_contexts.write().remove(&cid);
+    }
+}
+
 /// Handle a single VSOCK connection: drive the 4-step handshake.
 fn handle_connection(
     stream: std::os::fd::OwnedFd,
