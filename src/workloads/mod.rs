@@ -9,6 +9,7 @@ pub mod env;
 pub mod image;
 pub mod lifecycle;
 pub mod microvm;
+pub mod netns;
 pub mod pod_manager;
 pub mod probe_loop;
 pub mod probe_manager;
@@ -335,53 +336,50 @@ impl WorkloadManager {
             }
         }
 
-        // 7.2.5 (Option B) + 8.2.4: MicroVM gets an agent-assigned /30 pair.
-        // The guest IP is registered in SRC_IDENTITY_MAP before boot so the
-        // guest's first packet is attributable (fail-closed otherwise).
+        // 8.3 (Ruling H) + 8.2.4: BOTH runtimes get an agent-assigned /30 pair.
+        // The workload IP is registered in SRC_IDENTITY_MAP and POD_NET_COUNTERS
+        // BEFORE boot so the first packet is attributable (fail-closed otherwise).
         let mut registered_ip: Option<HostOrderIpv4> = None;
-        let mut microvm_ips: Option<(u32, u32)> = None; // (gateway, guest)
-        if spec.runtime == RuntimeKind::CloudHypervisor {
-            let (gw_ip, guest_ip) = self
+        let (gw_ip, wl_ip) = {
+            let (gw, wl) = self
                 .ip_allocator
                 .lock()
                 .unwrap()
-                .allocate_microvm_pair(&pod_id)?;
+                .allocate_p2p_pair(&pod_id)?;
             if let Some(registry) = &self.src_identity {
-                let ho = HostOrderIpv4(guest_ip);
+                let ho = HostOrderIpv4(wl);
                 if let Err(e) = registry.register(ho, &fp) {
-                    self.ip_allocator
-                        .lock()
-                        .unwrap()
-                        .release_microvm_pair(&pod_id);
+                    self.ip_allocator.lock().unwrap().release_p2p_pair(&pod_id);
                     return Err(e);
                 }
                 registered_ip = Some(ho);
             }
-            microvm_ips = Some((gw_ip, guest_ip));
-        }
+            // 8.2.6/8.3.4: pre-populate POD_NET_COUNTERS for the workload source IP.
+            if let Some(ebpf) = &self.ebpf_manager {
+                if let Ok(mut mgr) = ebpf.lock() {
+                    let _ = crate::ebpf::maps::prepopulate_pod_counters(
+                        &mut mgr.pod_net_counters,
+                        HostOrderIpv4(wl),
+                    );
+                }
+            }
+            (gw, wl)
+        };
 
         let boot_result = match spec.runtime {
-            RuntimeKind::Containerd => self.boot_containerd(spec, &mounts).await,
-            RuntimeKind::CloudHypervisor => {
-                let (gw_ip, guest_ip) = microvm_ips
-                    .ok_or_else(|| AgentError::Workload("missing MicroVM IPs".into()))?;
-                self.boot_microvm(spec, &mounts, guest_ip, gw_ip).await
-            }
+            RuntimeKind::Containerd => self.boot_containerd(spec, &mounts, wl_ip, gw_ip).await,
+            RuntimeKind::CloudHypervisor => self.boot_microvm(spec, &mounts, wl_ip, gw_ip).await,
         };
 
         let handle = match boot_result {
             Ok(h) => h,
             Err(e) => {
-                // Boot failed: release the registered identity + IP pair (no leak).
+                // Boot failed: release registered identity + IP pair (no leak).
+                // (Containerd destroys its own netns internally on failure.)
                 if let (Some(registry), Some(ho)) = (&self.src_identity, registered_ip) {
                     let _ = registry.unregister(ho);
                 }
-                if spec.runtime == RuntimeKind::CloudHypervisor && microvm_ips.is_some() {
-                    self.ip_allocator
-                        .lock()
-                        .unwrap()
-                        .release_microvm_pair(&pod_id);
-                }
+                self.ip_allocator.lock().unwrap().release_p2p_pair(&pod_id);
                 return Err(e);
             }
         };
@@ -420,8 +418,32 @@ impl WorkloadManager {
         &self,
         spec: &WorkloadSpec,
         mounts: &[PreparedMount],
+        container_ip: u32,
+        gateway_ip: u32,
     ) -> Result<u32, AgentError> {
-        self.containerd.boot(spec, mounts).await
+        let pod_spec = spec
+            .pod_spec
+            .as_ref()
+            .ok_or_else(|| AgentError::Workload("containerd boot requires full PodSpec".into()))?;
+        let pod_id = pod_spec
+            .pod_id
+            .clone()
+            .unwrap_or_else(|| spec.workload_id.clone());
+
+        // 8.3.2: create + configure the container's network namespace.
+        let ns = netns::create_netns(&pod_id).await?;
+        if let Err(e) = netns::configure_netns(&pod_id, container_ip, gateway_ip).await {
+            let _ = netns::destroy_netns(&pod_id).await;
+            return Err(e);
+        }
+
+        match self.containerd.boot(spec, mounts, &ns).await {
+            Ok(pid) => Ok(pid),
+            Err(e) => {
+                let _ = netns::destroy_netns(&pod_id).await;
+                Err(e)
+            }
+        }
     }
 
     async fn boot_microvm(
@@ -521,17 +543,6 @@ impl WorkloadManager {
             );
         }
 
-        // 8.2.6: Pre-populate POD_NET_COUNTERS for the guest source IP so net
-        // metrics aren't always zero (resolves audit A5).
-        if let Some(ebpf) = &self.ebpf_manager {
-            if let Ok(mut mgr) = ebpf.lock() {
-                let _ = crate::ebpf::maps::prepopulate_pod_counters(
-                    &mut mgr.pod_net_counters,
-                    HostOrderIpv4(guest_ip),
-                );
-            }
-        }
-
         let gateway_ip_addr = std::net::Ipv4Addr::from(gateway_ip.to_be_bytes());
         let handle = adapter
             .boot(
@@ -598,20 +609,18 @@ impl WorkloadManager {
             }
         }
 
-        // 7.2.5: unregister source identity + release the /30 IP pair.
-        if let Some(src_ip) = self.pod_source_ips.lock().unwrap().remove(pod_id) {
+        // 7.2.5 / 8.3: unregister source identity + release the /30 IP pair.
+        // Extract the value first so the MutexGuard drops immediately.
+        let src_ip_opt = self.pod_source_ips.lock().unwrap().remove(pod_id);
+        if let Some(src_ip) = src_ip_opt {
             if let Some(registry) = &self.src_identity {
                 if let Err(e) = registry.unregister(HostOrderIpv4(src_ip)) {
                     tracing::warn!(pod_id, error = %e, "SRC_IDENTITY_MAP unregister failed");
                 }
             }
-            if runtime == RuntimeKind::CloudHypervisor {
-                self.ip_allocator
-                    .lock()
-                    .unwrap()
-                    .release_microvm_pair(pod_id);
-            } else {
-                self.ip_allocator.lock().unwrap().release(pod_id);
+            self.ip_allocator.lock().unwrap().release_p2p_pair(pod_id);
+            if runtime == RuntimeKind::Containerd {
+                let _ = netns::destroy_netns(pod_id).await;
             }
         }
 
@@ -799,6 +808,17 @@ impl NodeIpAllocator {
             }
             !belongs
         });
+    }
+
+    /// Allocate a /30 point-to-point pair (gateway, workload). Generic across
+    /// runtimes: MicroVM uses it over a TAP link, containerd over a veth pair.
+    pub fn allocate_p2p_pair(&mut self, pod_id: &str) -> Result<(u32, u32), AgentError> {
+        self.allocate_microvm_pair(pod_id)
+    }
+
+    /// Release a /30 point-to-point pair allocated via `allocate_p2p_pair`.
+    pub fn release_p2p_pair(&mut self, pod_id: &str) {
+        self.release_microvm_pair(pod_id)
     }
 }
 

@@ -1142,3 +1142,55 @@ async fn boot_microvm_registers_attestation_and_cleans_up_on_failure() {
         "all attestation registrations must be unregistered on failed boot"
     );
 }
+
+// --- Phase 8.3: containerd netns / IPAM ---
+
+#[test]
+fn p2p_pair_aliases_match_microvm_pair() {
+    let mut a = NodeIpAllocator::new("172.30.0.0/24").unwrap();
+    let (gw1, wl1) = a.allocate_p2p_pair("c1").unwrap();
+    let (gw2, wl2) = a.allocate_microvm_pair("m1").unwrap();
+    assert_eq!(wl1, gw1 + 1);
+    assert_eq!(wl2, gw2 + 1);
+    assert_ne!(gw1, gw2);
+    assert_ne!(wl1, wl2);
+    a.release_p2p_pair("c1");
+    let (gw3, _wl3) = a.allocate_p2p_pair("c2").unwrap();
+    assert_eq!(gw3, gw1); // freed pair reused
+}
+
+#[test]
+fn netns_path_and_veth_name_are_well_formed() {
+    let p = fleetos_agent::workloads::netns::netns_path("pod-1");
+    assert!(p.to_string_lossy().contains("pod-1"));
+    // veth name must fit IFNAMSIZ (15 usable chars).
+    let short = fleetos_agent::workloads::netns::host_veth_name("web");
+    let long = fleetos_agent::workloads::netns::host_veth_name(
+        "a-very-long-workload-id-that-exceeds-ifnamesize",
+    );
+    assert!(short.len() <= 15);
+    assert!(long.len() <= 15);
+    assert!(short.starts_with("fveth"));
+    assert!(long.starts_with("fveth"));
+}
+
+#[tokio::test]
+#[ignore = "requires root + real kernel netns; run with --ignored on a capable host"]
+async fn containerd_netns_lifecycle() {
+    // Real-environment smoke: create, configure, destroy. Needs CAP_NET_ADMIN.
+    let pod_id = "netns-smoke";
+    let mut a = NodeIpAllocator::new("172.30.0.0/16").unwrap();
+    let (gw, wl) = a.allocate_p2p_pair(pod_id).unwrap();
+    let ns = fleetos_agent::workloads::netns::create_netns(pod_id)
+        .await
+        .unwrap();
+    assert!(ns.exists());
+    fleetos_agent::workloads::netns::configure_netns(pod_id, wl, gw)
+        .await
+        .unwrap();
+    fleetos_agent::workloads::netns::destroy_netns(pod_id)
+        .await
+        .unwrap();
+    assert!(!ns.exists());
+    a.release_p2p_pair(pod_id);
+}

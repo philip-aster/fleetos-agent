@@ -63,16 +63,21 @@ impl ContainerdAdapter {
         &self,
         spec: &WorkloadSpec,
         mounts: &[PreparedMount],
+        netns_path: &std::path::Path,
     ) -> Result<u32, AgentError> {
         let pod_spec = spec
             .pod_spec
             .as_ref()
             .ok_or_else(|| AgentError::Workload("containerd boot requires full PodSpec".into()))?;
-
         let pod_id = pod_spec
             .pod_id
             .clone()
             .unwrap_or_else(|| spec.workload_id.clone());
+
+        // 8.3.5: containerd-path rootfs prep = image available in the content
+        // store for the erofs snapshotter (NOT a raw erofs file — that's the
+        // MicroVM path). v1 placeholder assumes the image is pre-pulled.
+        self.ensure_image(&spec.image).await?;
 
         // Q3: Agent renders /etc/hosts for the containerd path.
         let hosts_path = format!("/run/fleetos/pods/{}/hosts", spec.workload_id);
@@ -87,7 +92,7 @@ impl ContainerdAdapter {
         let mut tasks = TasksClient::new(channel.clone());
 
         // 1. OCI spec (includes /etc/hosts bind-mount + cgroup limits).
-        let oci_spec = self.build_oci_spec(spec, mounts)?;
+        let oci_spec = self.build_oci_spec(spec, mounts, netns_path)?;
 
         // 2. Create container + task via the containerd SDK.
         //    SDK VERIFICATION POINT: containers/tasks service request shapes.
@@ -133,6 +138,17 @@ impl ContainerdAdapter {
 
         tracing::info!(pod_id, pid, "containerd container booted");
         Ok(pid)
+    }
+
+    /// Ensure the image is present in containerd's content store for the erofs
+    /// snapshotter. v1 placeholder: assumes pre-pulled (mirrors the MicroVM
+    /// `oci_to_erofs` placeholder). Replace with a real pull when wired.
+    async fn ensure_image(&self, image: &str) -> Result<(), AgentError> {
+        tracing::debug!(
+            image,
+            "containerd image availability (placeholder: assuming pre-pulled)"
+        );
+        Ok(())
     }
 
     /// Stop a container: SIGTERM → grace wait → SIGKILL → delete.
@@ -193,6 +209,7 @@ impl ContainerdAdapter {
         &self,
         spec: &WorkloadSpec,
         mounts: &[PreparedMount],
+        netns_path: &std::path::Path,
     ) -> Result<::prost_types::Any, AgentError> {
         let pod_spec = spec.pod_spec.as_ref().unwrap();
 
@@ -249,7 +266,8 @@ impl ContainerdAdapter {
             "linux": {
                 "namespaces": [
                     {"type": "pid"}, {"type": "ipc"}, {"type": "uts"},
-                    {"type": "mount"}, {"type": "network"}
+                    {"type": "mount"},
+                    {"type": "network", "path": netns_path.to_string_lossy()}
                 ],
                 "resources": {
                     "cpu": { "quota": cpu_limit * 100_000, "period": 100_000 },
