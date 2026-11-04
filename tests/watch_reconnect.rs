@@ -116,7 +116,7 @@ async fn watch_reconnect_and_monotonicity() {
         addr.to_string(),
         storage,
         keystore,
-        Arc::new(ca_pem),
+        Arc::new(RwLock::new(ca_pem)),
         Arc::new(RwLock::new(svid_state)),
     ));
 

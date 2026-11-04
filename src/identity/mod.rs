@@ -4,5 +4,6 @@
 
 pub mod degraded;
 pub mod keystore;
+pub mod renewal;
 pub mod sequences;
 pub mod svid;

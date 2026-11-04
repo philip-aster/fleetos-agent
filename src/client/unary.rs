@@ -8,9 +8,9 @@ use crate::client::retry::{RetryAction, classify_error};
 use crate::error::AgentError;
 use fleetos_core::proto::fleetos::{
     CsrRequest, DelegatedKeyRequest, DelegatedKeyResponse, FetchSecretRequest, MetricsAck,
-    PodEvent, PodMetrics, ReportPodEventsRequest, SealedSecret, StatusAck, SvidResponse,
-    TrustBundle, TrustBundleRequest, WorkloadStatusReport, ca_service_client::CaServiceClient,
-    delegation_service_client::DelegationServiceClient,
+    NodeStatusReport, PodEvent, PodMetrics, ReportPodEventsRequest, SealedSecret, StatusAck,
+    SvidResponse, TrustBundle, TrustBundleRequest, WorkloadStatusReport,
+    ca_service_client::CaServiceClient, delegation_service_client::DelegationServiceClient,
     pod_event_service_client::PodEventServiceClient, secret_service_client::SecretServiceClient,
     workload_status_service_client::WorkloadStatusServiceClient,
 };
@@ -177,6 +177,57 @@ pub async fn report_pod_events(
                 RetryAction::GiveUp(reason) => {
                     return Err(AgentError::Rpc(format!(
                         "ReportPodEvents failed: {}",
+                        reason
+                    )));
+                }
+            },
+        }
+    }
+}
+
+/// Report node liveness heartbeat (CORE-WI-6 / Phase 8.4.3).
+///
+/// Follows the exact redirect-and-retry pattern of `report_workload_status`
+/// per the CORE-WI-6 handover: "copy the report_workload_status wrapper
+/// shape in client/unary.rs exactly."
+///
+/// The heartbeat is a purely additive liveness signal — transient failures
+/// are tolerated because the lease timeout has enormous margin.
+pub async fn report_node_status(
+    control_client: &ControlPlaneClient,
+    report: NodeStatusReport,
+) -> Result<StatusAck, AgentError> {
+    let mut redirect_hops = 0usize;
+    let mut transient_retries = 0usize;
+    loop {
+        let channel = control_client.get_channel().await?;
+        let mut client = WorkloadStatusServiceClient::new(channel);
+        let req = report.clone();
+        match client.report_node_status(req).await {
+            Ok(response) => return Ok(response.into_inner()),
+            Err(status) => match classify_error(&status, redirect_hops) {
+                RetryAction::RedirectAndRetry { new_target, .. } => {
+                    tracing::info!(
+                        leader = %new_target,
+                        "ReportNodeStatus redirect, retargeting"
+                    );
+                    redirect_hops += 1;
+                    control_client.retarget(new_target).await;
+                }
+                RetryAction::RetrySameTarget { delay } => {
+                    transient_retries += 1;
+                    if transient_retries > MAX_TRANSIENT_RETRIES {
+                        return Err(AgentError::Rpc(format!(
+                            "ReportNodeStatus failed after {} retries: {}",
+                            transient_retries,
+                            status.message()
+                        )));
+                    }
+                    tokio::time::sleep(delay).await;
+                }
+                RetryAction::GiveUp(reason) => {
+                    return Err(AgentError::Rpc(format!(
+                        "ReportNodeStatus failed: {}",
                         reason
                     )));
                 }

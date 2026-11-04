@@ -4,4 +4,5 @@
 //! Push-only OTLP export. No inbound scrape endpoints.
 
 pub mod flow_events;
+pub mod node_status;
 pub mod pod_events;

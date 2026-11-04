@@ -91,6 +91,15 @@ pub struct NodeConfig {
     pub name: String,
     /// SPIFFE trust domain for the Data/Control overlay.
     pub trust_domain: String,
+    /// Node heartbeat interval in seconds (CORE-WI-6 / Phase 8.4.3).
+    /// Must be comfortably inside control's `node_lease_timeout_secs`
+    /// (default 3600). Recommended 30–60.
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+}
+
+fn default_heartbeat_interval_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Deserialize)]

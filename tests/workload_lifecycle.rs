@@ -220,7 +220,7 @@ async fn boot_pod_requests_and_installs_delegated_key() {
         addr,
         storage,
         keystore,
-        Arc::new(ca_pem),
+        Arc::new(tokio::sync::RwLock::new(ca_pem)),
         Arc::new(tokio::sync::RwLock::new(svid_state)),
     ));
 

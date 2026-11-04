@@ -5,6 +5,9 @@
 [node]
 name = "agent-1"
 trust_domain = "fleet.example.internal"
+# Node heartbeat interval in seconds (Phase 8.4.3 / CORE-WI-6).
+# Must be comfortably inside control's node_lease_timeout_secs (default 3600).
+heartbeat_interval_secs = 30
 
 # ---------------------------------------------------------------------------
 # Control plane connection

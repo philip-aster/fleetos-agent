@@ -17,8 +17,10 @@ use fleetos_agent::client::ControlPlaneClient;
 use fleetos_agent::config::AgentConfig;
 use fleetos_agent::ebpf::EbpfManager;
 use fleetos_agent::identity::keystore::TpmSealedStore;
+use fleetos_agent::identity::renewal::{RenewalConfig, SvidRenewalLoop};
 use fleetos_agent::identity::svid;
 use fleetos_agent::join;
+use fleetos_agent::observability::node_status::NodeStatusReporter;
 use fleetos_agent::observability::pod_events::PodEventReporter;
 use fleetos_agent::storage::Storage;
 use fleetos_agent::vsock_attest::VsockAttestServer;
@@ -124,17 +126,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let svid_state_lock = Arc::new(RwLock::new(svid_state));
 
     // --- Phase 5: Control plane client (mTLS) ---
-    let trust_bundle_pem = Arc::new(
+    let trust_bundle_pem = Arc::new(tokio::sync::RwLock::new(
         std::fs::read_to_string(&config.control.trust_bundle_path).map_err(|e| {
             fleetos_agent::error::AgentError::Config(format!("failed to read trust bundle: {}", e))
         })?,
-    );
+    ));
 
     let control_client = Arc::new(ControlPlaneClient::new(
         config.control.address.clone(),
         storage.clone(),
         keystore.clone(),
-        trust_bundle_pem,
+        trust_bundle_pem.clone(),
         svid_state_lock.clone(),
     ));
 
@@ -413,6 +415,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     tracing::info!("watch loops started: SAG, Schedule, Events, Routes");
 
+    // --- Phase 8.4.2: Node SVID renewal loop ---
+    let node_spiffe_id = fleetos_core::spiffe::SpiffeId::new(
+        &config.node.trust_domain,
+        "system",
+        fleetos_core::spiffe::IdKind::Node,
+        &config.node.name,
+    );
+    let renewal_config = RenewalConfig {
+        ttl_secs: config.svid.ttl_secs,
+        refresh_fraction: config.svid.refresh_fraction,
+    };
+    let renewal_loop = SvidRenewalLoop::new(
+        control_client.clone(),
+        keystore.clone(),
+        storage.clone(),
+        svid_state_lock.clone(),
+        node_spiffe_id.clone(),
+        renewal_config,
+    );
+    let renewal_shutdown_rx = shutdown_tx.subscribe();
+    let renewal_handle = tokio::spawn(async move {
+        renewal_loop.run(renewal_shutdown_rx).await;
+    });
+    tracing::info!("node SVID renewal loop started");
+
+    // --- Phase 8.4.3: Node liveness heartbeat ---
+    let node_svid_string = node_spiffe_id.to_string();
+    let node_status_reporter = NodeStatusReporter::new(
+        control_client.clone(),
+        node_svid_string,
+        config.node.heartbeat_interval_secs,
+    );
+    let heartbeat_shutdown_rx = shutdown_tx.subscribe();
+    let heartbeat_handle = tokio::spawn(async move {
+        node_status_reporter.run(heartbeat_shutdown_rx).await;
+    });
+    tracing::info!("node status reporter started");
+
+    // --- Phase 8.4.5: Periodic trust bundle refresh ---
+    let tb_refresh_client = control_client.clone();
+    let tb_refresh_shutdown_rx = shutdown_tx.subscribe();
+    let tb_refresh_handle = tokio::spawn(async move {
+        run_trust_bundle_refresh(tb_refresh_client, tb_refresh_shutdown_rx).await;
+    });
+    tracing::info!("trust bundle refresh task started");
+
     // --- Phase 13: Wait for shutdown signal ---
     tokio::signal::ctrl_c().await?;
     tracing::info!("shutdown signal received");
@@ -435,6 +483,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         events_handle,
         routes_watch_handle,
         probe_handle,
+        renewal_handle,
+        heartbeat_handle,
+        tb_refresh_handle,
     );
 
     // Detach eBPF programs.
@@ -450,4 +501,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("fleetos-agent shutdown complete");
     Ok(())
+}
+
+/// Periodic trust bundle refresh (Phase 8.4.5).
+///
+/// Calls `GetTrustBundle` every 5 minutes and updates the client's trust
+/// bundle if it changed. This ensures the agent picks up CA rotations
+/// without requiring a restart.
+///
+/// The interval is fixed at 300 seconds. Trust bundle rotations are rare
+/// (root CA lifetime is years), so a 5-minute poll is ample. If the RPC
+/// fails, we log and retry on the next tick.
+async fn run_trust_bundle_refresh(
+    control_client: Arc<ControlPlaneClient>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let interval = std::time::Duration::from_secs(300); // 5 minutes
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    tracing::info!("trust bundle refresh shutting down");
+                    return;
+                }
+            }
+            _ = ticker.tick() => {
+                match fleetos_agent::client::unary::get_trust_bundle(&control_client).await {
+                    Ok(bundle) => {
+                        let pem = ders_to_pem_string(&bundle.roots_der);
+                        control_client.update_trust_bundle(pem).await;
+                        tracing::debug!("trust bundle refreshed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "trust bundle refresh failed");
+                    }
+                }
+            }
+        }
+    }
+}
+/// Convert a list of DER-encoded certificates to a single PEM string.
+/// Used by the trust bundle refresh task (8.4.5).
+fn ders_to_pem_string(ders: &[Vec<u8>]) -> String {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let mut pem = String::new();
+    for der in ders {
+        let b64 = STANDARD.encode(der);
+        pem.push_str("-----BEGIN CERTIFICATE-----\n");
+        for chunk in b64.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+    }
+    pem
 }

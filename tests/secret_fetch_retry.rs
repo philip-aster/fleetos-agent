@@ -121,7 +121,7 @@ async fn secret_fetch_redirect_and_retry() {
         addr_a.clone(), // Initially target Server A
         storage,
         keystore,
-        Arc::new(ca_pem),
+        Arc::new(RwLock::new(ca_pem)),
         Arc::new(RwLock::new(svid_state)),
     ));
 
