@@ -74,6 +74,15 @@ pub struct Pod {
     /// emission so transient failures during initial startup (before the pod
     /// has ever been healthy) don't emit noise.
     pub probe_ever_passed: bool,
+    /// Phase 8.6.1: Resource footprint recorded at boot time.
+    /// Used by the reconciler to detect VPA-driven footprint mismatches.
+    pub vcpus: u32,
+    pub memory_bytes: u64,
+    /// Phase 8.6.3: Termination grace period from `TerminationSpec`.
+    /// Defaults to 30 if the PodSpec doesn't specify one.
+    pub termination_grace_secs: u32,
+    /// Phase 8.6.3: Restart policy from the PodSpec.
+    pub restart_policy: fleetos_core::proto::workload::RestartPolicy,
 }
 
 impl Pod {
@@ -106,6 +115,10 @@ impl Pod {
             probe_live: false,
             probe_failure_reported: false,
             probe_ever_passed: false,
+            vcpus: 0,
+            memory_bytes: 0,
+            termination_grace_secs: 30,
+            restart_policy: fleetos_core::proto::workload::RestartPolicy::Always,
         }
     }
 
@@ -154,11 +167,13 @@ impl Pod {
     }
 
     /// Get the restart policy for this pod.
-    /// Returns Never if not configured.
     pub fn restart_policy(&self) -> fleetos_core::proto::workload::RestartPolicy {
-        // In a full implementation, this would read from the PodSpec.
-        // For now, default to Always (K8s default).
-        fleetos_core::proto::workload::RestartPolicy::Always
+        self.restart_policy
+    }
+
+    /// Phase 8.6.1: Check if the pod's footprint matches the desired resources.
+    pub fn footprint_matches(&self, vcpus: u32, memory_bytes: u64) -> bool {
+        self.vcpus == vcpus && self.memory_bytes == memory_bytes
     }
 
     /// Check if the pod can transition to Running based on Ruling D gate.

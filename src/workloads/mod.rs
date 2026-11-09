@@ -5,6 +5,7 @@
 //! frame are terminated with grace periods.
 
 pub mod containerd;
+pub mod disruption;
 pub mod env;
 pub mod image;
 pub mod lifecycle;
@@ -32,6 +33,7 @@ use self::microvm::{MicroVmAdapter, VsockCidAllocator};
 use self::pod_manager::{Pod, PodManager, PodState};
 use self::reconciler::Reconciler;
 use self::volumes::{PreparedMount, VolumeConfig};
+use crate::workloads::disruption::DisruptionGuard;
 use fleetos_core::hash::IdentityFingerprint;
 use fleetos_core::spiffe::{IdKind, SpiffeId, WorkloadRole};
 use fleetos_ebpf_common::HostOrderIpv4;
@@ -201,26 +203,65 @@ impl WorkloadManager {
     }
 
     /// Reconcile desired state against running pods and apply.
+    ///
+    /// Phase 8.6.2: Routes evictions and replacements through the
+    /// FrameConsistencyGuard. The guard ensures the agent never acts
+    /// ahead of the frame.
     pub async fn reconcile(&self, desired: &[WorkloadSpec]) -> Result<(), AgentError> {
         let result = {
             let pm = self.pod_manager.read().await;
             Reconciler::reconcile(desired, &pm, &self.trust_domain)
         };
-
-        // Evict pods no longer desired (graceful).
+        // Phase 8.6.2: Construct the frame-consistency guard from the latest frame.
+        let guard = crate::workloads::disruption::FrameConsistencyGuard::from_assignments(desired);
+        // Evict pods no longer in the frame.
+        // Guard check: only evict if the frame has converged past this pod.
         for pod_id in &result.to_evict {
-            if let Err(e) = self.evict_pod(pod_id).await {
-                tracing::warn!(pod_id, error = %e, "eviction failed");
+            if guard.allow_disruption(
+                pod_id,
+                &crate::workloads::disruption::DisruptionTarget::ScaleDown,
+            ) {
+                if let Err(e) = self.evict_pod(pod_id).await {
+                    tracing::warn!(pod_id, error = %e, "eviction failed");
+                }
+            } else {
+                tracing::debug!(
+                    pod_id,
+                    "eviction deferred: pod still present in frame (frame-consistency guard)"
+                );
             }
         }
-
-        // Boot newly desired pods.
+        // Phase 8.6.1: Replace pods with footprint mismatches.
+        // Guard check: only replace if the frame has converged past the old pod.
+        for (old_pod_id, new_spec) in &result.to_replace {
+            if guard.allow_disruption(
+                old_pod_id,
+                &crate::workloads::disruption::DisruptionTarget::VerticalResize,
+            ) {
+                tracing::info!(
+                    old_pod_id,
+                    "footprint mismatch detected; replacing pod (VPA RECREATE)"
+                );
+                if let Err(e) = self.evict_pod(old_pod_id).await {
+                    tracing::warn!(pod_id = old_pod_id, error = %e, "failed to evict pod for replacement");
+                    continue;
+                }
+                if let Err(e) = self.boot_pod(new_spec).await {
+                    tracing::warn!(error = %e, "failed to boot replacement pod");
+                }
+            } else {
+                tracing::debug!(
+                    pod_id = old_pod_id,
+                    "replacement deferred: pod still present in frame (frame-consistency guard)"
+                );
+            }
+        }
+        // Boot new pods.
         for spec in &result.to_boot {
             if let Err(e) = self.boot_pod(spec).await {
                 tracing::warn!(workload = %spec.workload_id, error = %e, "boot failed");
             }
         }
-
         Ok(())
     }
 
@@ -396,6 +437,19 @@ impl WorkloadManager {
         pod.state = PodState::Booting;
         pod.pid = Some(handle);
         pod.mark_started();
+
+        // Phase 8.6: record footprint + termination from the PodSpec.
+        if let Some(res) = pod_spec.resources.as_ref() {
+            pod.vcpus = res.vcpus;
+            pod.memory_bytes = (res.memory_mb as u64) * 1024 * 1024;
+        }
+        pod.termination_grace_secs = pod_spec
+            .termination
+            .as_ref()
+            .map(|t| t.grace_period_seconds as u32)
+            .unwrap_or(30);
+        pod.restart_policy = pod_spec.restart_policy();
+
         if let Some(ho) = registered_ip {
             self.pod_source_ips
                 .lock()
@@ -565,7 +619,8 @@ impl WorkloadManager {
             let pod = pm
                 .get_pod(pod_id)
                 .ok_or_else(|| AgentError::Workload(format!("pod {pod_id} not found")))?;
-            let grace = 30; // Default grace; refine from TerminationSpec in Phase 5.
+            // Phase 8.6.3: use the pod's stored termination grace period.
+            let grace = pod.termination_grace_secs;
             (pod.runtime, pod.pid.unwrap_or(0), grace)
         };
 
@@ -591,11 +646,11 @@ impl WorkloadManager {
 
         match runtime {
             RuntimeKind::Containerd => {
-                self.containerd.stop(pod_id, grace).await?;
+                self.containerd.stop(pod_id, grace as u64).await?;
             }
             RuntimeKind::CloudHypervisor => {
                 if let Some(adapter) = self.microvms.write().await.remove(&(handle as u32)) {
-                    adapter.stop(handle as u32, grace).await?;
+                    adapter.stop(handle as u32, grace as u64).await?;
                     let interface = format!("vmtap{}", handle);
                     if let Some(guard) = &self.net_guard {
                         let _ = guard.disarm(&interface);
