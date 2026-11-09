@@ -87,6 +87,10 @@ impl ContainerdAdapter {
         let hosts_content = self.hosts_content.read().unwrap().clone();
         std::fs::write(&hosts_path, &hosts_content)?;
 
+        // Phase 8.5.4: Ensure the secrets directory exists for the bind-mount.
+        let secrets_dir = format!("/run/fleetos/pods/{}/secrets", pod_id);
+        std::fs::create_dir_all(&secrets_dir)?;
+
         let channel = self.channel().await?;
         let mut containers = ContainersClient::new(channel.clone());
         let mut tasks = TasksClient::new(channel.clone());
@@ -229,6 +233,19 @@ impl ContainerdAdapter {
                 "source": "proc"
             }),
         ];
+
+        // Phase 8.5.4: Bind-mount the pod's secrets directory (read-only).
+        let pod_id = pod_spec
+            .pod_id
+            .clone()
+            .unwrap_or_else(|| spec.workload_id.clone());
+        let secrets_dir = format!("/run/fleetos/pods/{}/secrets", pod_id);
+        oci_mounts.push(json!({
+            "destination": "/run/secrets",
+            "type": "bind",
+            "source": secrets_dir,
+            "options": ["rbind", "ro"]
+        }));
 
         // User-declared volume mounts.
         for m in mounts {

@@ -297,6 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage.clone(),
         keystore.clone(),
         svid_state_lock.clone(),
+        pod_manager.clone(),
     ));
 
     // --- Phase 9: Status reporter ---
@@ -394,6 +395,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ebpf_manager.clone(),
         config.node.trust_domain.clone(),
         pod_manager.clone(),
+        delegated_keys.clone(),
     ));
     let schedule_handle = tokio::spawn(fleetos_agent::wiring::run_schedule_watch(
         control_client.clone(),

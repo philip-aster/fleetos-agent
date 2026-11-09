@@ -220,17 +220,18 @@ fn route_to_dummy_ip_config(entry: &RouteEntry) -> Option<DummyIpRouteConfig> {
     })
 }
 
-/// WatchSag → policy sync (eBPF map population).
+/// WatchSag → policy sync (eBPF map population) + delegation revocation.
 /// Phase 7.1: Owns PolicySyncState, threads data_trust_domain.
+/// Phase 8.5.2: Checks revoked_delegation_ids against held delegations.
 pub async fn run_sag_watch(
     control_client: Arc<ControlPlaneClient>,
     ebpf_manager: Arc<std::sync::Mutex<EbpfManager>>,
     data_trust_domain: String,
     pod_manager: Arc<RwLock<PodManager>>,
+    delegated_keys: Arc<std::sync::RwLock<crate::identity::degraded::DelegatedKeyManager>>,
 ) {
     // Phase 7.1.2: Own a PolicySyncState instance, initialized empty, version 0.
     let mut sync_state = PolicySyncState::new();
-
     let stream = watch::watch_sag(control_client);
     pin_mut!(stream);
     while let Some(result) = stream.next().await {
@@ -243,9 +244,25 @@ pub async fn run_sag_watch(
                 } else {
                     // Phase 7.4.2: policy is live → mark all pods policy_enforced.
                     mark_all_pods_policy_enforced(&pod_manager).await;
+
+                    // Phase 8.5.2: Check revoked delegation IDs against held keys.
+                    // A revoked key must be dropped within one SagUpdate frame.
+                    if !update.revoked_delegation_ids.is_empty() {
+                        let mut mgr = delegated_keys.write().unwrap();
+                        for revoked_id in &update.revoked_delegation_ids {
+                            if let Some(target) = mgr.remove_by_delegation_id(revoked_id) {
+                                tracing::warn!(
+                                    target_svid = %target,
+                                    "delegated signing key revoked via SagUpdate"
+                                );
+                            }
+                        }
+                    }
+
                     tracing::debug!(
                         version = update.version,
                         rules = update.rules.len(),
+                        revoked_delegations = update.revoked_delegation_ids.len(),
                         "SAG applied"
                     );
                 }
@@ -365,6 +382,8 @@ pub struct SecretsHandler {
     svid_state: Arc<RwLock<SvidState>>,
     // Plaintext held in Zeroizing so it's scrubbed on drop (Ruling G hygiene).
     secrets: Arc<RwLock<HashMap<String, Zeroizing<Vec<u8>>>>>,
+    // Phase 8.5.3: PodManager for per-pod secret delivery.
+    pod_manager: Arc<RwLock<PodManager>>,
 }
 
 impl SecretsHandler {
@@ -373,6 +392,7 @@ impl SecretsHandler {
         storage: Arc<Storage>,
         keystore: Arc<TpmSealedStore>,
         svid_state: Arc<RwLock<SvidState>>,
+        pod_manager: Arc<RwLock<PodManager>>,
     ) -> Self {
         Self {
             control_client,
@@ -380,6 +400,7 @@ impl SecretsHandler {
             keystore,
             svid_state,
             secrets: Arc::new(RwLock::new(HashMap::new())),
+            pod_manager,
         }
     }
 
@@ -402,7 +423,54 @@ impl SecretsHandler {
             .await
             .insert(spiffe_id.to_string(), plaintext);
         tracing::info!(spiffe_id, "secret delivered");
+
+        // Phase 8.5.6: Propagate the updated secret to the running workload.
+        self.propagate_to_workloads(spiffe_id).await;
+
         Ok(())
+    }
+
+    /// Phase 8.5.6: Propagate a delivered secret to running workloads.
+    ///
+    /// For containerd: the bind-mount sees the file update on next read
+    /// (no restart needed if the workload reads lazily).
+    /// For MicroVM: the secret was already pushed via WorkloadConfig at boot.
+    /// A full re-push requires a new VSOCK message type (follow-up).
+    async fn propagate_to_workloads(&self, spiffe_id: &str) {
+        let parsed: SpiffeId = match spiffe_id.parse() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let pod_id = self.find_pod_for_spiffe(&parsed).await;
+        match pod_id {
+            Some(pid) => {
+                let pm = self.pod_manager.read().await;
+                if let Some(pod) = pm.get_pod(&pid) {
+                    match pod.runtime {
+                        crate::workloads::RuntimeKind::Containerd => {
+                            // Bind-mount sees the file update on next read.
+                            tracing::debug!(
+                                pod_id = %pid,
+                                "secret updated on disk; containerd bind-mount will see it"
+                            );
+                        }
+                        crate::workloads::RuntimeKind::CloudHypervisor => {
+                            // v1 limitation: full re-push requires a new VSOCK message type.
+                            tracing::warn!(
+                                pod_id = %pid,
+                                "secret updated on disk; MicroVM re-push not yet supported (v1 limitation)"
+                            );
+                        }
+                    }
+                }
+            }
+            None => {
+                tracing::debug!(
+                    spiffe_id = %spiffe_id,
+                    "no matching pod found; secret delivered to flat path"
+                );
+            }
+        }
     }
 
     // 7.3.1 / 7.3.2: load the node X25519 sealing key, then delegate to the
@@ -422,20 +490,47 @@ impl SecretsHandler {
     }
 
     // 7.3.3: hardened delivery.
+    // Phase 8.5.3: per-pod directory when a matching pod exists.
     async fn deliver(&self, spiffe_id: &str, plaintext: &[u8]) -> Result<(), AgentError> {
         // Defense-in-depth: reject anything that isn't a well-formed SPIFFE ID
         // before it touches the filesystem.
-        let _: SpiffeId = spiffe_id
+        let parsed: SpiffeId = spiffe_id
             .parse()
             .map_err(|e| AgentError::Secret(format!("invalid SPIFFE ID for delivery: {}", e)))?;
         // Sanitization is safe: every path separator ('/', ':') is replaced,
         // so no traversal is possible after substitution.
         let safe_name = spiffe_id.replace(['/', ':'], "_");
-        let path = std::path::PathBuf::from(format!("/run/fleetos/secrets/{safe_name}"));
+
+        // Phase 8.5.3: try per-pod delivery first.
+        let pod_id = self.find_pod_for_spiffe(&parsed).await;
+        let path = match pod_id {
+            Some(pid) => {
+                std::path::PathBuf::from(format!("/run/fleetos/pods/{pid}/secrets/{safe_name}"))
+            }
+            None => {
+                // Fallback: secret arrived before the pod booted.
+                std::path::PathBuf::from(format!("/run/fleetos/secrets/{safe_name}"))
+            }
+        };
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&path, plaintext)?;
         Ok(())
+    }
+
+    /// Phase 8.5.3: Find a pod matching the target SPIFFE ID.
+    ///
+    /// Matches on tenant + workload_id (the `name` component of the SPIFFE ID).
+    /// Returns the pod_id if found, None otherwise.
+    async fn find_pod_for_spiffe(&self, spiffe: &SpiffeId) -> Option<String> {
+        let pm = self.pod_manager.read().await;
+        for pod in pm.all_pods() {
+            if pod.tenant_id == spiffe.tenant && pod.workload_id == spiffe.name {
+                return Some(pod.pod_id.clone());
+            }
+        }
+        None
     }
 }

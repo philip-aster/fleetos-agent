@@ -11,6 +11,7 @@
 //!   - Workload binary path, args
 //!   - Trust domain, tenant, service, role
 //!   - Guest networking (IP, netmask, gateway)
+//!   - Secrets (CORE-WI-7: delivered from the per-pod secrets directory)
 use super::WorkloadContext;
 use super::verify::VerifiedGuest;
 use crate::error::AgentError;
@@ -18,7 +19,63 @@ use crate::identity::degraded::{DelegatedKeyManager, now_unix};
 use fleetos_core::spiffe::{IdKind, SpiffeId};
 use fleetos_core::vsock_proto::{DummyIpRouteConfig, VolumeMountConfig, WorkloadConfig};
 use std::sync::{Arc, RwLock};
-
+/// Maximum secret size for the env-var fallback path (≤ 4 KB).
+/// Secrets larger than this are delivered ONLY via `WorkloadConfig.secrets`.
+const MAX_ENV_SECRET_SIZE: usize = 4096;
+/// Maximum total secrets payload before we refuse to include them.
+/// The VSOCK frame cap is 16 MiB; leave headroom for the rest of the config.
+const MAX_TOTAL_SECRETS_SIZE: usize = 14 * 1024 * 1024;
+/// Read delivered secrets from the per-pod secrets directory.
+///
+/// Returns `(secret_name, plaintext_bytes)` pairs. Never logs secret values —
+/// only names and sizes.
+///
+/// The directory is `/run/fleetos/pods/{pod_id}/secrets/`, populated by
+/// `SecretsHandler::deliver()` (Phase 8.5.3). If the directory doesn't exist
+/// (no secrets delivered yet, or pod hasn't booted), returns an empty vec.
+fn read_pod_secrets(pod_id: &str) -> Vec<(String, Vec<u8>)> {
+    let secrets_dir = format!("/run/fleetos/pods/{}/secrets", pod_id);
+    let dir_path = std::path::Path::new(&secrets_dir);
+    if !dir_path.exists() {
+        return Vec::new();
+    }
+    let entries = match std::fs::read_dir(dir_path) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                pod_id = %pod_id,
+                error = %e,
+                "failed to read pod secrets directory"
+            );
+            return Vec::new();
+        }
+    };
+    let mut secrets = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        match std::fs::read(entry.path()) {
+            Ok(bytes) => {
+                // Log name + size only. NEVER log secret values.
+                tracing::debug!(
+                    pod_id = %pod_id,
+                    secret_name = %name,
+                    size_bytes = bytes.len(),
+                    "loaded secret for WorkloadConfig"
+                );
+                secrets.push((name, bytes));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    pod_id = %pod_id,
+                    secret_name = %name,
+                    error = %e,
+                    "failed to read secret file"
+                );
+            }
+        }
+    }
+    secrets
+}
 /// Builder for `WorkloadConfig`.
 ///
 /// Holds the agent state needed to construct configs, including the map-based
@@ -32,7 +89,6 @@ pub struct WorkloadConfigBuilder {
     /// caps this at the delegated key's remaining lifetime.
     svid_ttl_secs: u64,
 }
-
 impl WorkloadConfigBuilder {
     pub fn new(
         trust_domain: String,
@@ -46,17 +102,20 @@ impl WorkloadConfigBuilder {
             svid_ttl_secs,
         }
     }
-
     /// Set the dummy-IP routes (driven by WatchRoutes). Takes &self for Arc use.
     pub fn set_dummy_ip_routes(&self, routes: Vec<DummyIpRouteConfig>) {
         *self.dummy_ip_routes.write().unwrap() = routes;
     }
-
     /// Build a `WorkloadConfig` for a verified guest using the workload context.
     ///
     /// Generates a fresh keypair for the workload, builds a CSR carrying only
     /// the workload SPIFFE ID, and signs it with the delegated key for that
     /// workload (fail-closed: empty SVID fields if no valid key is held).
+    ///
+    /// CORE-WI-7: also reads delivered secrets from the per-pod directory and
+    /// populates `config.secrets`. Secrets ≤ 4 KB are additionally injected as
+    /// `FLEETOS_SECRET_{key}` env vars for backward compatibility with older
+    /// guest-init binaries that don't yet read the `secrets` field.
     pub fn build(
         &self,
         _guest: &VerifiedGuest,
@@ -71,13 +130,11 @@ impl WorkloadConfigBuilder {
             IdKind::Sa,
             &ctx.pod_spec.workload_id,
         );
-
         let now = now_unix();
         let has_key = {
             let mgr = self.delegated_keys.read().unwrap();
             mgr.has_valid_key(&workload_spiffe_id, now)
         };
-
         // Generate the workload SVID only if a valid delegated key is held
         // (fail-closed: avoid wasted keygen and leave fields empty otherwise).
         let (svid_cert_chain_der, svid_private_key_der) = if has_key {
@@ -85,14 +142,12 @@ impl WorkloadConfigBuilder {
             let workload_keypair = rcgen::KeyPair::generate()
                 .map_err(|e| AgentError::Identity(format!("workload keygen failed: {}", e)))?;
             let private_key_der = workload_keypair.serialize_der();
-
             // CSR carries ONLY the workload SPIFFE ID (role/ordinal stamped by
             // the delegated signer from the key's scope, never from the CSR).
             let csr = fleetos_core::spiffe::ca::build_csr(&workload_spiffe_id, &workload_keypair)
                 .map_err(|e| {
                 AgentError::Identity(format!("workload CSR build failed: {}", e))
             })?;
-
             let validity = std::time::Duration::from_secs(self.svid_ttl_secs);
             let mgr = self.delegated_keys.read().unwrap();
             match mgr.renew_svid_locally(&workload_spiffe_id, &csr.der, validity, now) {
@@ -119,15 +174,47 @@ impl WorkloadConfigBuilder {
             );
             (Vec::new(), Vec::new())
         };
-
-        // Populate env vars from PodSpec
-        let env_vars = ctx
+        // CORE-WI-7: Read delivered secrets from the per-pod directory.
+        let pod_secrets = ctx
+            .pod_spec
+            .pod_id
+            .as_ref()
+            .map(|pid| read_pod_secrets(pid))
+            .unwrap_or_default();
+        // Size guard: if total secrets exceed the frame cap headroom, skip them.
+        // This is a configuration bug, not a transport feature.
+        let total_secrets_size: usize = pod_secrets.iter().map(|(_, b)| b.len()).sum();
+        let pod_secrets = if total_secrets_size > MAX_TOTAL_SECRETS_SIZE {
+            tracing::error!(
+                total_bytes = total_secrets_size,
+                max_bytes = MAX_TOTAL_SECRETS_SIZE,
+                "total secrets exceed frame cap headroom; secrets NOT included in WorkloadConfig"
+            );
+            Vec::new()
+        } else {
+            pod_secrets
+        };
+        // Populate env vars from PodSpec + small-secret fallback.
+        let mut env_vars: Vec<(String, String)> = ctx
             .pod_spec
             .env
             .iter()
             .map(|e| (e.name.clone(), e.value.clone()))
             .collect();
-
+        // CORE-WI-7 backward compatibility: secrets ≤ 4 KB are also injected as
+        // FLEETOS_SECRET_{key} env vars so older guest-init binaries (that don't
+        // yet read the `secrets` field) can still access them.
+        for (name, bytes) in &pod_secrets {
+            if bytes.len() <= MAX_ENV_SECRET_SIZE {
+                use base64::{Engine, engine::general_purpose::STANDARD};
+                let b64 = STANDARD.encode(bytes);
+                let env_key = format!(
+                    "FLEETOS_SECRET_{}",
+                    name.to_uppercase().replace(['-', '.'], "_")
+                );
+                env_vars.push((env_key, b64));
+            }
+        }
         // Populate volume mounts from PodSpec
         let volume_mounts = ctx
             .pod_spec
@@ -139,12 +226,10 @@ impl WorkloadConfigBuilder {
                 read_only: vm.read_only,
             })
             .collect();
-
         // Workload binary path and args are not directly in PodSpec.
         // For now, derive from workload_id or use defaults.
         let workload_binary_path = format!("/usr/bin/{}", ctx.pod_spec.workload_id);
         let workload_args = Vec::new();
-
         Ok(WorkloadConfig {
             svid_cert_chain_der,
             svid_private_key_der,
@@ -160,9 +245,10 @@ impl WorkloadConfigBuilder {
             guest_ip: ctx.guest_ip,
             netmask: ctx.netmask,
             gateway: ctx.gateway,
+            // CORE-WI-7: secrets delivered to the guest.
+            secrets: pod_secrets,
         })
     }
-
     /// Fallback build when no workload context is available (e.g., test/dev).
     pub fn build_fallback(&self, _guest: &VerifiedGuest) -> Result<WorkloadConfig, AgentError> {
         Ok(WorkloadConfig {
@@ -180,15 +266,15 @@ impl WorkloadConfigBuilder {
             guest_ip: [0, 0, 0, 0],
             netmask: [0, 0, 0, 0],
             gateway: [0, 0, 0, 0],
+            // CORE-WI-7: no secrets in fallback.
+            secrets: Vec::new(),
         })
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use fleetos_core::proto::fleetos::{EnvVar, VolumeMount};
-
     #[test]
     fn config_push_populates_fields_from_context() {
         let builder = WorkloadConfigBuilder::new(
@@ -202,11 +288,9 @@ mod tests {
             role: "replica".to_string(),
             tenant: "acme".to_string(),
         }]);
-
         let guest = VerifiedGuest {
             guest_x25519_pubkey: [0x11; 32],
         };
-
         let ctx = WorkloadContext {
             pod_spec: fleetos_core::proto::fleetos::PodSpec {
                 tenant_id: "acme".to_string(),
@@ -227,7 +311,6 @@ mod tests {
             netmask: [255, 255, 255, 0],
             gateway: [10, 0, 0, 1],
         };
-
         let config = builder.build(&guest, &ctx).unwrap();
         assert_eq!(config.trust_domain, "fleet.example.internal");
         assert_eq!(config.tenant_id, "acme");
@@ -245,5 +328,7 @@ mod tests {
         // No delegated key installed -> SVID fields empty (fail-closed).
         assert!(config.svid_cert_chain_der.is_empty());
         assert!(config.svid_private_key_der.is_empty());
+        // No pod_id set -> no secrets directory -> empty secrets.
+        assert!(config.secrets.is_empty());
     }
 }

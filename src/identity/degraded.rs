@@ -137,6 +137,26 @@ impl DelegatedKeyManager {
         self.keys.remove(target_svid_id);
     }
 
+    /// Remove a delegated key by its delegation ID (Phase 8.5.1 revocation).
+    ///
+    /// Called when a `SagUpdate` frame carries this delegation ID in
+    /// `revoked_delegation_ids`. Iterates all held entries, finds the one
+    /// whose `delegation_id` matches, removes it, and returns the target
+    /// SPIFFE ID for logging.
+    ///
+    /// Returns `None` if no held key matches the given delegation ID.
+    pub fn remove_by_delegation_id(&mut self, delegation_id: &[u8]) -> Option<SpiffeId> {
+        let target = self.keys.iter().find_map(|(spiffe_id, entry)| {
+            if entry.delegation_id == delegation_id {
+                Some(spiffe_id.clone())
+            } else {
+                None
+            }
+        })?;
+        self.keys.remove(&target);
+        Some(target)
+    }
+
     /// Remove all expired keys.
     pub fn prune_expired(&mut self, now_unix: u64) {
         self.keys.retain(|_, e| now_unix < e.key.expires_at_unix);

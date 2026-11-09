@@ -53,6 +53,7 @@ fn result_round_trip() {
     assert_eq!(back.reason, r.reason);
 }
 
+// In the existing config_round_trip test, add the secrets field:
 #[test]
 fn config_round_trip() {
     let c = WorkloadConfig {
@@ -79,12 +80,51 @@ fn config_round_trip() {
         guest_ip: [10, 0, 0, 2],
         netmask: [255, 255, 255, 0],
         gateway: [10, 0, 0, 1],
+        // CORE-WI-7: additive field, empty for this test.
+        secrets: vec![],
     };
     let back: WorkloadConfig = round_trip(&c);
     assert_eq!(back.workload_binary_path, c.workload_binary_path);
     assert_eq!(back.dummy_ip_routes[0].dummy_ip, [240, 0, 0, 45]);
     assert_eq!(back.guest_ip, [10, 0, 0, 2]);
     assert_eq!(back.trust_domain, c.trust_domain);
+}
+/// CORE-WI-7: secrets survive the VSOCK wire encoding.
+#[test]
+fn config_round_trip_with_secrets() {
+    let c = WorkloadConfig {
+        svid_cert_chain_der: vec![vec![0x30, 0x82]],
+        svid_private_key_der: vec![0x04, 0x20],
+        env_vars: vec![("FOO".to_string(), "bar".to_string())],
+        volume_mounts: vec![],
+        dummy_ip_routes: vec![],
+        workload_binary_path: "/usr/bin/app".to_string(),
+        workload_args: vec![],
+        trust_domain: "fleet.example.internal".to_string(),
+        tenant_id: "acme".to_string(),
+        service_name: "db".to_string(),
+        role: "replica".to_string(),
+        guest_ip: [10, 0, 0, 2],
+        netmask: [255, 255, 255, 0],
+        gateway: [10, 0, 0, 1],
+        // A small text secret and a binary secret (simulating a TLS cert).
+        secrets: vec![
+            ("db-password".to_string(), b"hunter2".to_vec()),
+            (
+                "tls-cert.der".to_string(),
+                vec![0x30, 0x82, 0x01, 0x00, 0xFF, 0xAB],
+            ),
+        ],
+    };
+    let back: WorkloadConfig = round_trip(&c);
+    assert_eq!(back.secrets.len(), 2);
+    assert_eq!(back.secrets[0].0, "db-password");
+    assert_eq!(back.secrets[0].1, b"hunter2".to_vec());
+    assert_eq!(back.secrets[1].0, "tls-cert.der");
+    assert_eq!(back.secrets[1].1, vec![0x30, 0x82, 0x01, 0x00, 0xFF, 0xAB]);
+    // Non-secret fields still intact alongside the new field.
+    assert_eq!(back.trust_domain, "fleet.example.internal");
+    assert_eq!(back.guest_ip, [10, 0, 0, 2]);
 }
 
 #[test]
