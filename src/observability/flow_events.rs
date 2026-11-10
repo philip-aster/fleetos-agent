@@ -58,6 +58,9 @@ impl FlowOtlpExporter {
     /// The endpoint should be an OTLP gRPC endpoint, e.g.,
     /// `"http://otel-collector:4317"`.
     pub fn new(endpoint: &str) -> Result<Self, AgentError> {
+        if endpoint.is_empty() {
+            return Err(AgentError::Config("OTLP endpoint cannot be empty".into()));
+        }
         let exporter = LogExporter::builder()
             .with_tonic()
             .with_endpoint(endpoint)
