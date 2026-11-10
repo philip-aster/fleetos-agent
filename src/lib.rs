@@ -24,6 +24,8 @@ pub mod wiring;
 
 pub mod client;
 
+pub mod debugging;
+
 pub mod ebpf;
 
 pub mod policy;

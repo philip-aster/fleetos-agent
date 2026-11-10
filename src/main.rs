@@ -292,6 +292,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     tracing::info!("pod event reporter started");
 
+    // --- Phase 8.7: Debug tunnel (AgentDebugService client leg) ---
+    let debug_tunnel = fleetos_agent::debugging::DebugTunnel::new(
+        control_client.clone(),
+        pod_manager.clone(),
+        containerd_adapter.clone(),
+    );
+    let debug_shutdown_rx = shutdown_tx.subscribe();
+    let debug_handle = tokio::spawn(async move {
+        debug_tunnel.run(debug_shutdown_rx).await;
+    });
+    tracing::info!("debug tunnel started");
+
     let secrets_handler = std::sync::Arc::new(fleetos_agent::wiring::SecretsHandler::new(
         control_client.clone(),
         storage.clone(),
@@ -488,6 +500,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         renewal_handle,
         heartbeat_handle,
         tb_refresh_handle,
+        debug_handle,
     );
 
     // Detach eBPF programs.
